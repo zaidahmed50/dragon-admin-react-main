@@ -203,6 +203,14 @@ export const menuListWithPermissions = [
                     },
                     {
                         id: 6,
+                        name: "Products",
+                        path: "/finance/inventory/Products/",
+                        icon: 'brand',
+                        requiredPermissions: ['UNIT_GET'],
+                        subdropdownMenu: false
+                    },
+                    {
+                        id: 7,
                         name: "Vendors",
                         path: "/finance/inventory/vendors",
                         icon: 'vendor',

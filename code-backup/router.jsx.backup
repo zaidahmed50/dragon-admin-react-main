@@ -73,6 +73,7 @@ import DragonCoreArea from "../pages/dragon-core-area";
 import Inventory from "../pages/Category.jsx";
 import SubCategory from "@/components/finance/inventory/sub_category/SubCategory.jsx";
 import Units from "@/components/finance/inventory/brand/Units.jsx";
+import Products from "@/components/finance/inventory/brand/Products.jsx";
 import StockView from "@/components/stock/StockView.jsx";
 import DepartmentsDesignations from "@/components/dragonCore/DepartmentAndDesignations/DepartmentsDesignations.jsx";
 import DistributionPorts from "@/components/dragonCore/DistributationPorts/DistributionPorts.jsx";
@@ -392,7 +393,7 @@ export const router = createBrowserRouter([
                 path: "/finance/inventory/brand/",
                 element: <Units/>
             },
-
+             
             {
                 path: "/support/tickets",
                 element: <TicketsPage/>

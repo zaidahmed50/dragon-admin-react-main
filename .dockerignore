@@ -1,0 +1,11 @@
+.git
+.github
+.idea
+node_modules
+dist
+code-backup
+extra-code
+npm-debug.log*
+Dockerfile*
+docker-compose*.yml
+README.md

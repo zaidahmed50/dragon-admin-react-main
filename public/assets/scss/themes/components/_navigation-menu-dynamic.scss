@@ -1,0 +1,259 @@
+/*
+ * Dynamic Navigation Menu Styles
+ * Uses CSS variables for theme-aware styling
+ */
+
+/* Navigation Menu Items */
+.nxl-item {
+    .nxl-link {
+        color: var(--nav-color);
+        transition: all 0.3s ease;
+        
+        &:hover {
+            background-color: var(--nav-hover-color);
+            color: var(--nav-active-color);
+            
+            .nxl-micon {
+                color: var(--color-primary);
+            }
+        }
+        
+        .nxl-micon {
+            color: var(--nav-icon-color);
+            transition: color 0.3s ease;
+        }
+        
+        .nxl-mtext {
+            color: inherit;
+        }
+        
+        .nxl-arrow {
+            color: var(--nav-color);
+            transition: color 0.3s ease;
+        }
+    }
+    
+    /* Active Menu Item */
+    &.active {
+        > .nxl-link {
+            background-color: var(--nav-hover-color);
+            color: var(--color-primary);
+            font-weight: 600;
+            
+            .nxl-micon {
+                color: var(--color-primary);
+            }
+            
+            .nxl-arrow {
+                color: var(--color-primary);
+            }
+        }
+    }
+    
+    /* Active Trigger State */
+    &.nxl-trigger {
+        > .nxl-link {
+            background-color: var(--nav-hover-color);
+            
+            .nxl-arrow {
+                transform: rotate(90deg);
+                color: var(--color-primary);
+            }
+        }
+    }
+}
+
+/* Submenu Styling */
+.nxl-submenu {
+    background-color: var(--nav-bg);
+    border-left: 2px solid var(--nav-border-color);
+    
+    .nxl-item {
+        .nxl-link {
+            padding-left: 45px;
+            font-size: 0.875rem;
+            
+            &:hover {
+                background-color: var(--nav-hover-color);
+                color: var(--color-primary);
+                padding-left: 50px;
+            }
+        }
+        
+        &.active {
+            > .nxl-link {
+                color: var(--color-primary);
+                font-weight: 600;
+                border-left: 3px solid var(--color-primary);
+                padding-left: 47px;
+            }
+        }
+    }
+    
+    /* Nested Submenu */
+    .nxl-submenu {
+        .nxl-item {
+            .nxl-link {
+                padding-left: 60px;
+                
+                &:hover {
+                    padding-left: 65px;
+                }
+            }
+            
+            &.active {
+                > .nxl-link {
+                    padding-left: 62px;
+                }
+            }
+        }
+    }
+}
+
+/* Menu Visibility States */
+.nxl-menu-visible {
+    display: block !important;
+    animation: slideDown 0.3s ease;
+}
+
+.nxl-menu-hidden {
+    display: none !important;
+}
+
+/* Smooth Slide Animation */
+@keyframes slideDown {
+    from {
+        opacity: 0;
+        transform: translateY(-10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+/* Navigation Badge/Counter (if used) */
+.nxl-badge {
+    background-color: var(--color-primary);
+    color: var(--color-primary-contrast);
+    border-radius: 12px;
+    padding: 2px 8px;
+    font-size: 0.7rem;
+    font-weight: 600;
+    margin-left: auto;
+}
+
+/* Navigation Divider */
+.nxl-divider {
+    border-bottom: 1px solid var(--nav-border-color);
+    margin: 10px 0;
+    opacity: 0.5;
+}
+
+/* Navigation Caption/Header */
+.nxl-caption {
+    color: var(--nav-color);
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 15px 20px 8px;
+    opacity: 0.7;
+}
+
+/* Collapsed Navigation State */
+.nxl-navigation-collapsed {
+    .nxl-mtext {
+        display: none;
+    }
+    
+    .nxl-arrow {
+        display: none;
+    }
+    
+    .nxl-submenu {
+        position: absolute;
+        left: 100%;
+        top: 0;
+        min-width: 200px;
+        background-color: var(--bg-paper);
+        border: 1px solid var(--border-main);
+        border-radius: 4px;
+        box-shadow: 0 5px 15px var(--shadow-md);
+        z-index: 1000;
+    }
+}
+
+/* Active Submenu Indicator */
+.nxl-item.nxl-hasmenu.active {
+    position: relative;
+    
+    &::before {
+        content: '';
+        position: absolute;
+        left: 0;
+        top: 50%;
+        transform: translateY(-50%);
+        width: 3px;
+        height: 30px;
+        background-color: var(--color-primary);
+        border-radius: 0 3px 3px 0;
+    }
+}
+
+/* Hover Effect Enhancement */
+.nxl-item .nxl-link {
+    position: relative;
+    overflow: hidden;
+    
+    &::before {
+        content: '';
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 0;
+        height: 100%;
+        background-color: var(--color-primary);
+        opacity: 0.1;
+        transition: width 0.3s ease;
+    }
+    
+    &:hover::before {
+        width: 100%;
+    }
+}
+
+/* Icon Rotation on Expand */
+.nxl-arrow {
+    transition: transform 0.3s ease, color 0.3s ease;
+}
+
+.nxl-item.nxl-trigger > .nxl-link .nxl-arrow {
+    transform: rotate(90deg);
+}
+
+/* Accessibility: Focus States */
+.nxl-link {
+    &:focus-visible {
+        outline: 2px solid var(--color-primary);
+        outline-offset: 2px;
+    }
+}
+
+/* Dark Mode Specific Adjustments */
+.app-skin-dark {
+    .nxl-submenu {
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    }
+    
+    .nxl-item .nxl-link:hover {
+        background-color: var(--nav-hover-color);
+    }
+}
+
+/* Light Mode Specific Adjustments */
+.app-skin-light {
+    .nxl-submenu {
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+    }
+}

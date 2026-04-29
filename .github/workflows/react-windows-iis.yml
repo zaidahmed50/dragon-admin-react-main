@@ -1,0 +1,77 @@
+name: React CI/CD (Windows IIS - Automated)
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+          cache: npm
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build React app
+        run: npm run build
+
+      - name: Create deployment package
+        run: |
+          cd dist
+          zip -r ../build.zip .
+          cd ..
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: react-build-${{ github.run_number }}
+          path: build.zip
+          retention-days: 7
+
+      - name: Trigger deployment webhook
+        continue-on-error: true
+        run: |
+          echo "🚀 Triggering deployment on Windows server..."
+          
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "http://${{ secrets.WIN_HOST }}:9000/webhook/" \
+            -H "Content-Type: application/json" \
+            -H "X-Webhook-Secret: ${{ secrets.WEBHOOK_SECRET }}" \
+            -d "{\"run_number\": ${{ github.run_number }}}")
+          
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | head -n-1)
+          
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "✅ Deployment webhook triggered successfully!"
+            echo "Response: $BODY"
+          else
+            echo "⚠️ Webhook returned status code: $HTTP_CODE"
+            echo "Response: $BODY"
+            echo ""
+            echo "💡 Webhook might not be running. You can deploy manually by running this on your server:"
+            echo "C:\deploy\deploy-from-github.ps1 -GithubToken YOUR_TOKEN -RunNumber ${{ github.run_number }}"
+          fi
+          
+      - name: Deployment summary
+        run: |
+          echo "=============================================="
+          echo "✅ Build completed and uploaded!"
+          echo ""
+          echo "📦 Artifact: react-build-${{ github.run_number }}"
+          echo "🔗 Download URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo ""
+          echo "🚀 Automatic deployment triggered"
+          echo "📊 Check server logs: C:\deploy\logs\webhook.log"
+          echo ""
+          echo "Manual deployment command (if needed):"
+          echo "C:\deploy\deploy-from-github.ps1 -GithubToken YOUR_TOKEN -RunNumber ${{ github.run_number }}"
+          echo "=============================================="

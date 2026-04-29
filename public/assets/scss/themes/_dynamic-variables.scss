@@ -1,0 +1,323 @@
+/*
+<--!----------------------------------------------------------------!-->
+<--! Dynamic Theme Variables (CSS Custom Properties) !-->
+<--!----------------------------------------------------------------!-->
+* 
+* This file demonstrates how to use CSS custom properties (variables)
+* that automatically update when the theme changes.
+* 
+* These variables are set by the JavaScript theme system and will
+* automatically adapt to light/dark mode changes.
+*/
+
+/*
+<--!----------------------------------------------------------------!-->
+<--! Root CSS Variables (Applied via JavaScript) !-->
+<--!----------------------------------------------------------------!-->
+*/
+:root {
+    /* These are set by src/theme/cssVariables.js */
+    /* They automatically update on theme change */
+    
+    /* Primary Colors */
+    /* --color-primary: #ff9800; */
+    /* --color-primary-light: #ffb74d; */
+    /* --color-primary-dark: #f57c00; */
+    
+    /* Background Colors (Theme-aware) */
+    /* --bg-default: changes with theme */
+    /* --bg-paper: changes with theme */
+    
+    /* Text Colors (Theme-aware) */
+    /* --text-primary: changes with theme */
+    /* --text-secondary: changes with theme */
+    
+    /* Border Colors (Theme-aware) */
+    /* --border-main: changes with theme */
+}
+
+/*
+<--!----------------------------------------------------------------!-->
+<--! Usage Examples - Replace hardcoded colors with CSS variables !-->
+<--!----------------------------------------------------------------!-->
+*/
+
+/* BEFORE (Hardcoded - doesn't adapt to theme):
+.my-card {
+    background-color: #ffffff;
+    color: #4b5563;
+    border: 1px solid #e5e7eb;
+}
+*/
+
+/* AFTER (Dynamic - adapts to theme): */
+.my-card {
+    background-color: var(--bg-paper);
+    color: var(--text-primary);
+    border: 1px solid var(--border-main);
+}
+
+/* Primary colored elements */
+.btn-primary {
+    background-color: var(--color-primary);
+    color: var(--color-primary-contrast);
+    border: none;
+    
+    &:hover {
+        background-color: var(--color-primary-dark);
+    }
+}
+
+/* Status badges */
+.badge {
+    padding: 4px 12px;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    font-weight: 500;
+    
+    &.badge-success {
+        background-color: var(--bg-soft-success);
+        color: var(--color-success);
+    }
+    
+    &.badge-danger {
+        background-color: var(--bg-soft-danger);
+        color: var(--color-danger);
+    }
+    
+    &.badge-warning {
+        background-color: var(--bg-soft-warning);
+        color: var(--color-warning);
+    }
+    
+    &.badge-info {
+        background-color: var(--bg-soft-info);
+        color: var(--color-info);
+    }
+}
+
+/* Cards with dynamic theming */
+.custom-card {
+    background-color: var(--bg-paper);
+    color: var(--text-primary);
+    border: 1px solid var(--border-main);
+    border-radius: 4px;
+    padding: 25px;
+    box-shadow: 0 1px 3px var(--shadow-sm);
+    
+    .card-header {
+        color: var(--text-primary);
+        border-bottom: 1px solid var(--border-light);
+        margin-bottom: 20px;
+        padding-bottom: 15px;
+    }
+    
+    .card-body {
+        color: var(--text-secondary);
+    }
+    
+    &:hover {
+        border-color: var(--border-medium);
+    }
+}
+
+/* Navigation styles */
+.sidebar {
+    background-color: var(--nav-bg);
+    color: var(--nav-color);
+    border-right: 1px solid var(--nav-border-color);
+    
+    .nav-item {
+        color: var(--nav-color);
+        padding: 10px 20px;
+        
+        &:hover {
+            background-color: var(--nav-hover-color);
+        }
+        
+        &.active {
+            color: var(--nav-active-color);
+            background-color: var(--nav-hover-color);
+        }
+        
+        .nav-icon {
+            color: var(--nav-icon-color);
+        }
+    }
+}
+
+/* Header styles */
+.header {
+    background-color: var(--header-bg);
+    border-bottom: 1px solid var(--header-border-color);
+    
+    .header-link {
+        color: var(--header-link-color);
+        
+        &:hover {
+            color: var(--color-primary);
+        }
+    }
+}
+
+/* Tables */
+.custom-table {
+    background-color: var(--bg-paper);
+    
+    thead {
+        background-color: var(--bg-default);
+        
+        th {
+            color: var(--text-primary);
+            border-bottom: 2px solid var(--border-medium);
+        }
+    }
+    
+    tbody {
+        tr {
+            border-bottom: 1px solid var(--border-light);
+            
+            &:hover {
+                background-color: var(--bg-default);
+            }
+            
+            td {
+                color: var(--text-primary);
+            }
+        }
+    }
+}
+
+/* Forms */
+.form-control {
+    background-color: var(--bg-paper);
+    color: var(--text-primary);
+    border: 1px solid var(--border-main);
+    
+    &:focus {
+        border-color: var(--color-primary);
+        box-shadow: 0 0 0 3px var(--bg-soft-primary);
+    }
+    
+    &::placeholder {
+        color: var(--text-disabled);
+    }
+    
+    &:disabled {
+        background-color: var(--bg-default);
+        color: var(--text-disabled);
+    }
+}
+
+/* Alerts */
+.alert {
+    border-radius: 4px;
+    padding: 15px 20px;
+    
+    &.alert-success {
+        background-color: var(--bg-soft-success);
+        color: var(--color-success-dark);
+        border-left: 4px solid var(--color-success);
+    }
+    
+    &.alert-danger {
+        background-color: var(--bg-soft-danger);
+        color: var(--color-danger-dark);
+        border-left: 4px solid var(--color-danger);
+    }
+    
+    &.alert-warning {
+        background-color: var(--bg-soft-warning);
+        color: var(--color-warning-dark);
+        border-left: 4px solid var(--color-warning);
+    }
+    
+    &.alert-info {
+        background-color: var(--bg-soft-info);
+        color: var(--color-info-dark);
+        border-left: 4px solid var(--color-info);
+    }
+}
+
+/* Modals */
+.modal {
+    .modal-content {
+        background-color: var(--bg-paper);
+        color: var(--text-primary);
+        border: 1px solid var(--border-main);
+    }
+    
+    .modal-header {
+        border-bottom: 1px solid var(--border-main);
+    }
+    
+    .modal-footer {
+        border-top: 1px solid var(--border-main);
+    }
+}
+
+/* Dropdowns */
+.dropdown-menu {
+    background-color: var(--bg-paper);
+    border: 1px solid var(--border-main);
+    box-shadow: 0 5px 15px var(--shadow-md);
+    
+    .dropdown-item {
+        color: var(--text-primary);
+        
+        &:hover {
+            background-color: var(--bg-default);
+        }
+        
+        &.active {
+            background-color: var(--color-primary);
+            color: var(--color-primary-contrast);
+        }
+    }
+    
+    .dropdown-divider {
+        border-top: 1px solid var(--border-light);
+    }
+}
+
+/*
+<--!----------------------------------------------------------------!-->
+<--! Migration Checklist !-->
+<--!----------------------------------------------------------------!-->
+* 
+* When migrating existing SCSS:
+* 
+* 1. Background colors:
+*    - #ffffff, white → var(--bg-paper) or var(--color-white)
+*    - #f0f2f8 → var(--bg-default)
+*    - #0f172a (dark) → var(--bg-paper) or var(--nav-bg)
+* 
+* 2. Text colors:
+*    - #4b5563 → var(--text-primary)
+*    - #64748b, #6b7280 → var(--text-secondary)
+*    - #9ca3af → var(--text-disabled)
+* 
+* 3. Border colors:
+*    - #e5e7eb → var(--border-main)
+*    - #f3f4f6 → var(--border-light)
+*    - #1b2436 (dark) → var(--border-main) or var(--nav-border-color)
+* 
+* 4. Primary/Units colors:
+*    - #ff9800 → var(--color-primary)
+*    - #25b865 → var(--color-success)
+*    - #d13b4c → var(--color-danger)
+*    - #ffa21d → var(--color-warning)
+*    - #3dc7be → var(--color-info)
+* 
+* 5. Navigation/Header:
+*    - Use var(--nav-*) and var(--header-*) variables
+* 
+* 6. Shadows:
+*    - rgba(0,0,0,0.1) → var(--shadow-sm)
+*    - rgba(0,0,0,0.15) → var(--shadow-md)
+*    - rgba(0,0,0,0.2) → var(--shadow-lg)
+* 
+* 7. Soft backgrounds:
+*    - Use var(--bg-soft-primary), var(--bg-soft-success), etc.
+* 
+*/

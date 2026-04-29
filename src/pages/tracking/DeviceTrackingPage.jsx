@@ -1,0 +1,1780 @@
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
+import mqtt from 'mqtt';
+import {
+  ArrowLeft, MapPin, RefreshCw, Loader2, Download,
+  ChevronLeft, ChevronRight, Shield, Sheet, LayoutPanelTop,
+  Plus, Pencil, Trash2, X, Check, Upload, Undo2, MousePointer2,
+  Maximize2, Minimize2, Activity,
+  Settings, Timer, Gauge, SatelliteDish, Link2, SlidersHorizontal,
+  Play, Pause, SkipBack, AlertTriangle, Route,
+} from 'lucide-react';
+import {
+  MapContainer, TileLayer, Marker, Popup,
+  Polyline, CircleMarker, Circle as LeafletCircle, Polygon, useMap, useMapEvents,
+} from 'react-leaflet';
+import L from 'leaflet';
+import 'leaflet/dist/leaflet.css';
+import * as XLSX from 'xlsx';
+import { trackingService } from '../../services/trackingService';
+
+const MQTT_WS_URL = import.meta.env.VITE_MQTT_WS_URL || 'ws://localhost:9001/mqtt';
+
+// ── Leaflet icon fix ──────────────────────────────────────────────────────────
+delete L.Icon.Default.prototype._getIconUrl;
+L.Icon.Default.mergeOptions({
+  iconUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
+  iconRetinaUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon-2x.png',
+  shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png',
+});
+
+function makePin(color) {
+  return new L.DivIcon({
+    className: '',
+    html: `<svg xmlns="http://www.w3.org/2000/svg" width="24" height="36" viewBox="0 0 24 36">
+      <path d="M12 0C5.37 0 0 5.37 0 12c0 9 12 24 12 24s12-15 12-24C24 5.37 18.63 0 12 0z" fill="${color}" stroke="white" stroke-width="2"/>
+      <circle cx="12" cy="12" r="5" fill="white"/>
+    </svg>`,
+    iconSize: [24, 36], iconAnchor: [12, 36], popupAnchor: [0, -36],
+  });
+}
+const startPin = makePin('#22c55e');
+const endPin   = makePin('#ef4444');
+
+function getPointColor(reason) {
+  const r = (reason ?? '').toLowerCase().trim();
+  if (r.includes('moving') || r.includes('drive') || r.includes('motion') || r.includes('start') || r.includes('trip')) return '#22c55e';
+  if (r.includes('idle') || r.includes('stop') || r.includes('park') || r.includes('stationary') || r.includes('halt')) return '#ef4444';
+  return '#3b82f6';
+}
+
+function speedColor(kmh) {
+  if (kmh <= 0)   return '#94a3b8';
+  if (kmh < 10)   return '#22c55e';
+  if (kmh < 30)   return '#84cc16';
+  if (kmh < 60)   return '#eab308';
+  if (kmh < 90)   return '#f97316';
+  if (kmh < 120)  return '#ef4444';
+  return '#ff0000';
+}
+
+function buildRouteSegments(pts) {
+  if (pts.length < 2) return [];
+  const segs = [];
+  let seg = {
+    pts: [[pts[0].latitude, pts[0].longitude]],
+    color: speedColor(pts[0].speed ?? 0),
+  };
+  for (let i = 1; i < pts.length; i++) {
+    const c = speedColor(pts[i].speed ?? 0);
+    seg.pts.push([pts[i].latitude, pts[i].longitude]);
+    if (c !== seg.color) {
+      segs.push(seg);
+      seg = { pts: [[pts[i].latitude, pts[i].longitude]], color: c };
+    }
+  }
+  if (seg.pts.length >= 2) segs.push(seg);
+  return segs;
+}
+
+function bearingIcon(bearing, color) {
+  return new L.DivIcon({
+    className: '',
+    html: `<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 14 14"
+                style="transform:rotate(${bearing ?? 0}deg);display:block">
+             <polygon points="7,1 11,13 7,10 3,13"
+                      fill="${color}" stroke="${color}" stroke-width="1.2"/>
+           </svg>`,
+    iconSize: [22, 22],
+    iconAnchor: [11, 11],
+  });
+}
+
+function parsePolygonPoints(raw) {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return parsed.map((p) => {
+        if (Array.isArray(p)) return [p[0], p[1]];
+        return [(p.lat ?? p.latitude), (p.lng ?? p.longitude)];
+      });
+    }
+  } catch { /* ignore */ }
+  return [];
+}
+
+function formatDateTimeWithMillis(value) {
+  if (!value) return '-';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  const pad = (num, size = 2) => String(num).padStart(size, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}`;
+}
+
+function normalizeReason(reason) {
+  const normalized = reason?.trim();
+  return normalized ? normalized : 'Unspecified';
+}
+
+function getHistorySortValue(point, field) {
+  switch (field) {
+    case 'id': return point.id > 0 ? point.id : null;
+    case 'localPrimaryId': return point.localPrimaryId ?? null;
+    case 'receivedAt': { const t = point.receivedAt ? new Date(point.receivedAt).getTime() : NaN; return Number.isNaN(t) ? null : t; }
+    case 'deviceRdt': return point.deviceRdt?.trim() || null;
+    case 'gpsRdt': return point.gpsRdt?.trim() || null;
+    case 'latitude': return point.latitude ?? null;
+    case 'longitude': return point.longitude ?? null;
+    case 'speed': return point.speed ?? null;
+    case 'accuracy': return point.accuracy ?? null;
+    case 'altitude': return point.altitude ?? null;
+    case 'bearing': return point.bearing ?? null;
+    case 'satellites': return point.connectedSatellite ?? point.availableSatellite ?? null;
+    case 'provider': return point.provider?.trim() || null;
+    case 'versionNo': return point.versionNo?.trim() || null;
+    case 'uploadRetryCount': return point.uploadRetryCount ?? null;
+    case 'igStatus': return point.igStatus ?? null;
+    case 'reason': return normalizeReason(point.reason);
+    default: return null;
+  }
+}
+
+function compareHistoryValues(left, right, direction) {
+  if (left == null && right == null) return 0;
+  if (left == null) return 1;
+  if (right == null) return -1;
+  if (typeof left === 'number' && typeof right === 'number') {
+    return direction === 'asc' ? left - right : right - left;
+  }
+  const lt = String(left), rt = String(right);
+  return direction === 'asc'
+    ? lt.localeCompare(rt, undefined, { numeric: true, sensitivity: 'base' })
+    : rt.localeCompare(lt, undefined, { numeric: true, sensitivity: 'base' });
+}
+
+const HISTORY_TABLE_COLUMNS = [
+  { label: '#' },
+  { label: 'ID', sortField: 'id' },
+  { label: 'Local Primary ID', sortField: 'localPrimaryId' },
+  { label: 'Received At', sortField: 'receivedAt' },
+  { label: 'Device RDT', sortField: 'deviceRdt' },
+  { label: 'GPS RDT', sortField: 'gpsRdt' },
+  { label: 'Lat', sortField: 'latitude' },
+  { label: 'Lng', sortField: 'longitude' },
+  { label: 'Speed', sortField: 'speed' },
+  { label: 'Accuracy', sortField: 'accuracy' },
+  { label: 'Alt', sortField: 'altitude' },
+  { label: 'Bearing', sortField: 'bearing' },
+  { label: 'Satellites', sortField: 'satellites' },
+  { label: 'Provider', sortField: 'provider' },
+  { label: 'Version', sortField: 'versionNo' },
+  { label: 'Upload Retry', sortField: 'uploadRetryCount' },
+  { label: 'IG', sortField: 'igStatus' },
+  { label: 'Reason', sortField: 'reason', className: 'min-w-[180px]' },
+];
+
+function todayStart() { const d = new Date(); d.setHours(0,0,0,0); return fmt(d); }
+function todayEnd()   { const d = new Date(); d.setHours(23,59,59,0); return fmt(d); }
+function fmt(d) {
+  const p = (n) => String(n).padStart(2,'0');
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+function metersBetween(a, b) {
+  return L.latLng(a[0], a[1]).distanceTo(L.latLng(b[0], b[1]));
+}
+
+const BLANK_DRAW = {
+  phase: 'idle', type: 'CIRCLE', circleCenter: null, circleRadius: null,
+  polygonPts: [], mousePos: null, name: '', editId: null, bufferMeters: 0,
+};
+
+const GEO_COLOR = {
+  CIRCLE:  '#f59e0b',
+  POLYGON: '#a855f7',
+  LINE:    '#06b6d4',
+};
+
+const BLANK_CONFIG = {
+  configurationTimer: undefined,
+  uploadTimer: undefined,
+  movingTimer: undefined,
+  stopTimer: undefined,
+  heartbeatTimer: undefined,
+  angleThreshold: undefined,
+  overSpeedingThreshold: undefined,
+  distanceThreshold: undefined,
+  retryCounter: undefined,
+  setMinUpdateIntervalMillis: undefined,
+  setMinUpdateDistanceMeters: undefined,
+  baseURL: undefined,
+};
+
+const TRACKING_CONFIG_SECTIONS = [
+  {
+    id: 'timers',
+    title: 'Timing Logs',
+    eyebrow: 'Device rhythm',
+    description: 'How often the tracker wakes up, samples data, uploads, and keeps the session alive.',
+    icon: Timer,
+    surfaceClassName: 'border-sky-200/70 bg-sky-50/85 dark:border-sky-500/20 dark:bg-sky-500/10',
+    badgeClassName: 'border-sky-200/80 bg-sky-500/10 text-sky-700 dark:border-sky-500/25 dark:bg-sky-500/15 dark:text-sky-200',
+    iconClassName: 'bg-sky-500/15 text-sky-600 shadow-lg shadow-sky-500/10 dark:bg-sky-500/15 dark:text-sky-100',
+    gridClassName: 'md:grid-cols-2 xl:grid-cols-3',
+    fields: [
+      { key: 'configurationTimer', label: 'Configuration Timer', description: 'How often the device refreshes its config from the platform.', unit: 's', step: 1, min: 0 },
+      { key: 'uploadTimer', label: 'Upload Timer', description: 'The Logs used to push live tracking points upstream.', unit: 's', step: 1, min: 0 },
+      { key: 'movingTimer', label: 'Moving Timer', description: 'Delay before movement is treated as an active trip.', unit: 's', step: 1, min: 0 },
+      { key: 'stopTimer', label: 'Stop Timer', description: 'How long the device waits before it marks the vehicle as stopped.', unit: 's', step: 1, min: 0 },
+      { key: 'heartbeatTimer', label: 'Heartbeat Timer', description: 'Keep-alive interval used to confirm the tracker is online.', unit: 's', step: 1, min: 0 },
+    ],
+  },
+  {
+    id: 'thresholds',
+    title: 'Motion Intelligence',
+    eyebrow: 'Decision thresholds',
+    description: 'Sensitivity settings that control direction changes, alerts, distance sampling, and retry behavior.',
+    icon: Gauge,
+    surfaceClassName: 'border-amber-200/70 bg-amber-50/85 dark:border-amber-500/20 dark:bg-amber-500/10',
+    badgeClassName: 'border-amber-200/80 bg-amber-500/10 text-amber-700 dark:border-amber-500/25 dark:bg-amber-500/15 dark:text-amber-200',
+    iconClassName: 'bg-amber-500/15 text-amber-600 shadow-lg shadow-amber-500/10 dark:bg-amber-500/15 dark:text-amber-100',
+    gridClassName: 'md:grid-cols-2 xl:grid-cols-4',
+    fields: [
+      { key: 'angleThreshold', label: 'Angle Threshold', description: 'Minimum turn angle required before a new point is considered meaningful.', unit: 'deg', step: 0.5, min: 0 },
+      { key: 'overSpeedingThreshold', label: 'Over-Speed Threshold', description: 'Speed limit that triggers over-speeding behavior or flags.', unit: 'km/h', step: 1, min: 0 },
+      { key: 'distanceThreshold', label: 'Distance Threshold', description: 'Minimum movement before a new point is worth recording.', unit: 'm', step: 1, min: 0 },
+      { key: 'retryCounter', label: 'Retry Counter', description: 'How many times failed uploads should be retried before giving up.', step: 1, min: 0 },
+    ],
+  },
+  {
+    id: 'connection',
+    title: 'GPS & Delivery',
+    eyebrow: 'Acquisition and routing',
+    description: 'Control minimum GPS update density and the server endpoint the device should target.',
+    icon: SatelliteDish,
+    surfaceClassName: 'border-emerald-200/70 bg-emerald-50/85 dark:border-emerald-500/20 dark:bg-emerald-500/10',
+    badgeClassName: 'border-emerald-200/80 bg-emerald-500/10 text-emerald-700 dark:border-emerald-500/25 dark:bg-emerald-500/15 dark:text-emerald-200',
+    iconClassName: 'bg-emerald-500/15 text-emerald-600 shadow-lg shadow-emerald-500/10 dark:bg-emerald-500/15 dark:text-emerald-100',
+    gridClassName: 'md:grid-cols-2',
+    fields: [
+      { key: 'setMinUpdateIntervalMillis', label: 'Min GPS Update Interval', description: 'Minimum time between two GPS fixes coming from the device.', unit: 'ms', step: 1, min: 0 },
+      { key: 'setMinUpdateDistanceMeters', label: 'Min GPS Update Distance', description: 'Minimum movement required before a fresh GPS fix is emitted.', unit: 'm', step: 0.5, min: 0 },
+      { key: 'baseURL', label: 'Server Base URL', description: 'Optional endpoint override that gets pushed down to the tracker.', inputType: 'text', placeholder: 'https://tracking.example.com', cardSpanClassName: 'md:col-span-2' },
+    ],
+  },
+];
+
+const TRACKING_CONFIG_FIELD_COUNT = TRACKING_CONFIG_SECTIONS.reduce((c, s) => c + s.fields.length, 0);
+
+function buildTrackingConfigDraft(config) {
+  if (!config) return { ...BLANK_CONFIG };
+  return {
+    configurationTimer: config.configurationTimer ?? undefined,
+    uploadTimer: config.uploadTimer ?? undefined,
+    movingTimer: config.movingTimer ?? undefined,
+    stopTimer: config.stopTimer ?? undefined,
+    heartbeatTimer: config.heartbeatTimer ?? undefined,
+    angleThreshold: config.angleThreshold ?? undefined,
+    overSpeedingThreshold: config.overSpeedingThreshold ?? undefined,
+    distanceThreshold: config.distanceThreshold ?? undefined,
+    retryCounter: config.retryCounter ?? undefined,
+    setMinUpdateIntervalMillis: config.setMinUpdateIntervalMillis ?? undefined,
+    setMinUpdateDistanceMeters: config.setMinUpdateDistanceMeters ?? undefined,
+    baseURL: config.baseURL ?? '',
+  };
+}
+
+function getTrackingConfigValue(source, key) {
+  return source ? source[key] : undefined;
+}
+
+function getTrackingEndpointLabel(value) {
+  const url = typeof value === 'string' ? value.trim() : '';
+  if (!url) return 'Default endpoint';
+  try { return new URL(url).host; } catch { return url.replace(/^https?:\/\//, ''); }
+}
+
+function CenterOnLocation({ target }) {
+  const map = useMap();
+  const prev = useRef('');
+  useEffect(() => {
+    if (!target) return;
+    const key = target.join(',');
+    if (key === prev.current) return;
+    prev.current = key;
+    map.setView(target, Math.max(map.getZoom(), 15), { animate: true });
+  }, [target, map]);
+  return null;
+}
+
+function FitBounds({ positions, trigger }) {
+  const map = useMap();
+  const prevTrigger = useRef(-1);
+  useEffect(() => {
+    if (!positions.length || trigger === prevTrigger.current) return;
+    prevTrigger.current = trigger;
+    map.fitBounds(L.latLngBounds(positions), { padding: [30, 30] });
+  }, [trigger, positions, map]);
+  return null;
+}
+
+function InvalidateMapSize({ layoutKey }) {
+  const map = useMap();
+  useEffect(() => {
+    const raf = window.requestAnimationFrame(() => { map.invalidateSize(); });
+    return () => window.cancelAnimationFrame(raf);
+  }, [layoutKey, map]);
+  return null;
+}
+
+function PointHoverHandler({ points, onHover }) {
+  const map = useMapEvents({
+    mousemove(e) {
+      if (!points.length) return;
+      const THRESH_SQ = 18 * 18;
+      let best = null, bestD = Infinity;
+      for (const p of points) {
+        const cp = map.latLngToContainerPoint([p.latitude, p.longitude]);
+        const d = (cp.x - e.containerPoint.x) ** 2 + (cp.y - e.containerPoint.y) ** 2;
+        if (d < THRESH_SQ && d < bestD) { bestD = d; best = p; }
+      }
+      onHover(best);
+    },
+    mouseout() { onHover(null); },
+  });
+  useEffect(() => { return () => { onHover(null); }; }, [onHover]);
+  void map;
+  return null;
+}
+
+function MapInteractionHandler({ draw, onMapClick, onMouseMove }) {
+  const active = !['idle', 'type-select', 'confirm'].includes(draw.phase);
+  const map = useMapEvents({
+    click(e) { if (active) onMapClick(e.latlng.lat, e.latlng.lng); },
+    mousemove(e) { if (active) onMouseMove(e.latlng.lat, e.latlng.lng); },
+  });
+  useEffect(() => {
+    map.getContainer().style.cursor = active ? 'crosshair' : '';
+    return () => { map.getContainer().style.cursor = ''; };
+  }, [active, map]);
+  return null;
+}
+
+function PinnedMarkerLayer({ info }) {
+  const markerRef = useRef(null);
+  useEffect(() => { if (markerRef.current) markerRef.current.openPopup(); }, [info.lat, info.lng, info.title]);
+  const icon = new L.DivIcon({
+    className: '',
+    html: `<div style="position:relative;width:36px;height:36px;">
+      <div style="position:absolute;inset:0;border-radius:50%;background:${info.color};opacity:0.25;"></div>
+      <div style="position:absolute;inset:6px;border-radius:50%;background:${info.color};border:2.5px solid white;box-shadow:0 2px 10px rgba(0,0,0,0.35);"></div>
+    </div>`,
+    iconSize: [36, 36], iconAnchor: [18, 18], popupAnchor: [0, -20],
+  });
+  return (
+    <Marker ref={markerRef} position={[info.lat, info.lng]} icon={icon} zIndexOffset={3000}>
+      <Popup autoPan closeButton>
+        <div style={{ minWidth: 170, padding: '2px 0' }}>
+          <p style={{ fontWeight: 700, fontSize: 13, marginBottom: 3, color: info.color }}>{info.title}</p>
+          <p style={{ fontSize: 11, color: '#64748b', marginBottom: 4, lineHeight: 1.4 }}>{info.detail}</p>
+          <p style={{ fontSize: 10, fontFamily: 'monospace', color: '#94a3b8' }}>{info.lat.toFixed(6)}, {info.lng.toFixed(6)}</p>
+        </div>
+      </Popup>
+    </Marker>
+  );
+}
+
+function geofenceCenter(g) {
+  if (g.type === 'CIRCLE' && g.centerLat != null && g.centerLng != null) return [g.centerLat, g.centerLng];
+  const pts = parsePolygonPoints(g.polygonPoints);
+  if (pts.length === 0) return null;
+  const lat = pts.reduce((s, p) => s + p[0], 0) / pts.length;
+  const lng = pts.reduce((s, p) => s + p[1], 0) / pts.length;
+  return [lat, lng];
+}
+
+// ── Main page ─────────────────────────────────────────────────────────────────
+export function DeviceTrackingPage() {
+  const { deviceUuid } = useParams();
+  const navigate = useNavigate();
+
+  const [tableOpen, setTableOpen] = useState(true);
+  const [activePanel, setActivePanel] = useState(null);
+  const [leftMode, setLeftMode] = useState('map');
+
+  const [fromDt, setFromDt] = useState(todayStart);
+  const [toDt, setToDt] = useState(todayEnd);
+  const [page, setPage] = useState(0);
+  const [pageSize] = useState(2000);
+  const [historySortField, setHistorySortField] = useState('localPrimaryId');
+  const [historySortDirection, setHistorySortDirection] = useState('desc');
+  const [totalPages, setTotalPages] = useState(0);
+  const [totalElements, setTotalElements] = useState(0);
+  const [points, setPoints] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [hasLoaded, setHasLoaded] = useState(false);
+
+  const [geoTypes, setGeoTypes] = useState([]);
+  const [geofences, setGeofences] = useState([]);
+  const [geoLoading, setGeoLoading] = useState(false);
+  const [geoDeleting, setGeoDeleting] = useState(null);
+  const [geoSaving, setGeoSaving] = useState(false);
+  const [showGeoOnMap, setShowGeoOnMap] = useState(true);
+  const [geoPage, setGeoPage] = useState(0);
+  const [geoTotalPages, setGeoTotalPages] = useState(0);
+  const [geoTotal, setGeoTotal] = useState(0);
+
+  const [geoEvents, setGeoEvents] = useState([]);
+  const [geoEventsLoading, setGeoEventsLoading] = useState(false);
+  const [geoEventsTotal, setGeoEventsTotal] = useState(0);
+  const [geoEventsPage, setGeoEventsPage] = useState(0);
+  const [geoEventsTotalPages, setGeoEventsTotalPages] = useState(0);
+
+  const [hoverPoint, setHoverPoint] = useState(null);
+  const [draw, setDraw] = useState(BLANK_DRAW);
+  const drawRef = useRef(draw);
+  drawRef.current = draw;
+
+  const [fitBoundsKey, setFitBoundsKey] = useState(0);
+  const [centerTarget, setCenterTarget] = useState(null);
+  const [pinnedMarker, setPinnedMarker] = useState(null);
+  const trackingClientRef = useRef(null);
+
+  const [uploadModal, setUploadModal] = useState(false);
+  const [uploadJson, setUploadJson] = useState('');
+  const [uploading, setUploading] = useState(false);
+  const [uploadMsg, setUploadMsg] = useState(null);
+
+  const [configModal, setConfigModal] = useState(false);
+  const [configLoading, setConfigLoading] = useState(false);
+  const [configSaving, setConfigSaving] = useState(false);
+  const [configData, setConfigData] = useState(null);
+  const [configEditing, setConfigEditing] = useState(false);
+  const [configForm, setConfigForm] = useState({ ...BLANK_CONFIG });
+
+  const [playbackActive, setPlaybackActive] = useState(false);
+  const [playbackIdx, setPlaybackIdx] = useState(0);
+  const [playbackSpeed, setPlaybackSpeed] = useState(1);
+  const playbackRef = useRef(null);
+  const initialHistoryDeviceRef = useRef(null);
+  const playbackPointSourceIdx = points.length > 0 ? points.length - 1 - playbackIdx : -1;
+  const playbackPoint = playbackActive && playbackPointSourceIdx >= 0 ? points[playbackPointSourceIdx] : null;
+
+  const [trips, setTrips] = useState([]);
+  const [tripsLoading, setTripsLoading] = useState(false);
+  const [tripsTotal, setTripsTotal] = useState(0);
+  const [, setTripsPage] = useState(0);
+  const [, setTripsTotalPages] = useState(0);
+  const [selectedTrip, setSelectedTrip] = useState(null);
+
+  const [trackEvents, setTrackEvents] = useState([]);
+  const [trackEventsLoading, setTrackEventsLoading] = useState(false);
+  const [trackEventsTotal, setTrackEventsTotal] = useState(0);
+
+  const [, setAnalytics] = useState(null);
+  const [, setAnalyticsLoading] = useState(false);
+
+  const polyline = points.map((p) => [p.latitude, p.longitude]);
+  const mapCenter = polyline.length > 0 ? polyline[Math.floor(polyline.length / 2)] : [33.6844, 73.0479];
+
+  const routeSegments = useMemo(() => buildRouteSegments(points), [points]);
+
+  const sortedHistoryPoints = useMemo(() => {
+    return points
+      .map((point, index) => ({ point, index }))
+      .sort((left, right) => {
+        const result = compareHistoryValues(
+          getHistorySortValue(left.point, historySortField),
+          getHistorySortValue(right.point, historySortField),
+          historySortDirection
+        );
+        return result !== 0 ? result : left.index - right.index;
+      })
+      .map(({ point }) => point);
+  }, [historySortDirection, historySortField, points]);
+
+  const historySpeedStats = useMemo(() => {
+    const speeds = points.map((p) => p.speed).filter((s) => typeof s === 'number' && Number.isFinite(s));
+    if (speeds.length === 0) return { min: null, avg: null, max: null, count: 0 };
+    const min = Math.min(...speeds), max = Math.max(...speeds);
+    const avg = speeds.reduce((sum, s) => sum + s, 0) / speeds.length;
+    return { min, avg, max, count: speeds.length };
+  }, [points]);
+
+  const historyReasonStats = useMemo(() => {
+    const m = new Map();
+    points.forEach((p) => { const r = normalizeReason(p.reason); m.set(r, (m.get(r) ?? 0) + 1); });
+    return Array.from(m.entries()).map(([label, count]) => ({ label, count })).sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+  }, [points]);
+
+  const effectiveTotalPages = useMemo(() => {
+    if (totalPages > 0) return totalPages;
+    if (totalElements > 0) return Math.max(1, Math.ceil(totalElements / pageSize));
+    return hasLoaded ? 1 : 0;
+  }, [hasLoaded, pageSize, totalElements, totalPages]);
+
+  const arrowPoints = useMemo(() => {
+    if (points.length < 2) return [];
+    const step = Math.max(1, Math.floor(points.length / 60));
+    return points.filter((_, i) => i > 0 && i % step === 0 && i < points.length - 1);
+  }, [points]);
+
+  const configPreviewSource = configEditing ? configForm : configData;
+  const configHeroStats = configData ? [
+    { label: 'Upload Logs', value: getTrackingConfigValue(configPreviewSource, 'uploadTimer') ?? '—', unit: 's', detail: 'Point upload interval', Icon: Upload, accentClassName: 'from-sky-500/20 to-cyan-400/10 text-sky-50' },
+    { label: 'Heartbeat', value: getTrackingConfigValue(configPreviewSource, 'heartbeatTimer') ?? '—', unit: 's', detail: 'Online ping interval', Icon: Activity, accentClassName: 'from-indigo-500/20 to-blue-400/10 text-slate-50' },
+    { label: 'Motion threshold', value: getTrackingConfigValue(configPreviewSource, 'distanceThreshold') ?? '—', unit: 'm', detail: 'Distance before logging', Icon: Gauge, accentClassName: 'from-amber-500/20 to-orange-400/10 text-amber-50' },
+    { label: 'Endpoint', value: getTrackingEndpointLabel(getTrackingConfigValue(configPreviewSource, 'baseURL')), unit: '', detail: 'Server target', Icon: Link2, accentClassName: 'from-emerald-500/20 to-teal-400/10 text-emerald-50' },
+  ] : [];
+
+  const fetchHistory = useCallback(async (pg) => {
+    if (!deviceUuid) return;
+    setLoading(true);
+    try {
+      const resp = await trackingService.getHistory(deviceUuid, { from: fromDt, to: toDt, page: pg, size: pageSize });
+      if (resp.success && resp.data) {
+        const resolvedTotalElements = resp.data.totalElements > 0 ? resp.data.totalElements : resp.data.content.length;
+        const resolvedPageSize = resp.data.size > 0 ? resp.data.size : pageSize;
+        const resolvedTotalPages = resp.data.totalPages > 0
+          ? resp.data.totalPages
+          : resolvedTotalElements > 0 ? Math.ceil(resolvedTotalElements / resolvedPageSize) : 1;
+        setPoints(resp.data.content);
+        setTotalPages(resolvedTotalPages);
+        setTotalElements(resolvedTotalElements);
+        setPage(typeof resp.data.number === 'number' ? resp.data.number : pg);
+        setFitBoundsKey((k) => k + 1);
+      }
+    } catch { /**/ } finally { setLoading(false); setHasLoaded(true); }
+  }, [deviceUuid, fromDt, toDt, pageSize]);
+
+  useEffect(() => {
+    if (playbackActive && points.length > 0) {
+      const intervalMs = Math.max(50, 300 / playbackSpeed);
+      playbackRef.current = setInterval(() => {
+        setPlaybackIdx((prev) => {
+          const next = prev + 1;
+          if (next >= points.length) { setPlaybackActive(false); return prev; }
+          return next;
+        });
+      }, intervalMs);
+    } else {
+      if (playbackRef.current) clearInterval(playbackRef.current);
+    }
+    return () => { if (playbackRef.current) clearInterval(playbackRef.current); };
+  }, [playbackActive, playbackSpeed, points.length]);
+
+  useEffect(() => {
+    if (points.length === 0) { setPlaybackActive(false); setPlaybackIdx(0); return; }
+    setPlaybackIdx((prev) => Math.min(prev, points.length - 1));
+  }, [points.length]);
+
+  const fetchTrips = useCallback(async (pg) => {
+    if (!deviceUuid) return;
+    setTripsLoading(true);
+    try {
+      const resp = await trackingService.getTrips(deviceUuid, { from: fromDt, to: toDt, page: pg, size: 10 });
+      if (resp.success && resp.data) {
+        setTrips(resp.data.content);
+        setTripsTotal(resp.data.totalElements);
+        setTripsTotalPages(resp.data.totalPages);
+        setTripsPage(pg);
+      }
+    } catch { /**/ } finally { setTripsLoading(false); }
+  }, [deviceUuid, fromDt, toDt]);
+
+  const fetchTrackEvents = useCallback(async () => {
+    if (!deviceUuid) return;
+    setTrackEventsLoading(true);
+    try {
+      const resp = await trackingService.getTrackingEvents(deviceUuid, { from: fromDt, to: toDt, size: 50 });
+      if (resp.success && resp.data) { setTrackEvents(resp.data.content); setTrackEventsTotal(resp.data.totalElements); }
+    } catch { /**/ } finally { setTrackEventsLoading(false); }
+  }, [deviceUuid, fromDt, toDt]);
+
+  useEffect(() => {
+    if (!deviceUuid) return;
+    setAnalyticsLoading(true);
+    trackingService.getAnalytics(deviceUuid, { from: fromDt, to: toDt })
+      .then((resp) => { if (resp.success && resp.data) setAnalytics(resp.data); })
+      .catch(() => {})
+      .finally(() => setAnalyticsLoading(false));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const fetchGeofences = useCallback(async (pg = 0) => {
+    if (!deviceUuid) return;
+    setGeoLoading(true);
+    try {
+      const resp = await trackingService.getGeofences(deviceUuid, { page: pg, size: 8 });
+      if (resp.success && resp.data) {
+        setGeofences(resp.data.content);
+        setGeoPage(pg);
+        setGeoTotalPages(resp.data.totalPages);
+        setGeoTotal(resp.data.totalElements);
+      }
+    } catch { /**/ } finally { setGeoLoading(false); }
+  }, [deviceUuid]);
+
+  const fetchGeoTypes = useCallback(async () => {
+    if (!deviceUuid) return;
+    try {
+      const resp = await trackingService.getGeofenceTypes(deviceUuid);
+      if (resp.success && resp.data) setGeoTypes(resp.data);
+    } catch { /**/ }
+  }, [deviceUuid]);
+
+  const fetchGeoEvents = useCallback(async (pg = 0) => {
+    if (!deviceUuid) return;
+    setGeoEventsLoading(true);
+    try {
+      const resp = await trackingService.getGeofenceEvents(deviceUuid, { page: pg, size: 10 });
+      if (resp.success && resp.data) {
+        setGeoEvents(resp.data.content);
+        setGeoEventsTotal(resp.data.totalElements);
+        setGeoEventsPage(pg);
+        setGeoEventsTotalPages(resp.data.totalPages);
+      }
+    } catch { /**/ } finally { setGeoEventsLoading(false); }
+  }, [deviceUuid]);
+
+  useEffect(() => {
+    if (!deviceUuid) return;
+    const clientId = `tracking-${deviceUuid}-${Date.now()}`;
+    const client = mqtt.connect(MQTT_WS_URL, {
+      clientId, clean: true, reconnectPeriod: 5000, connectTimeout: 10000,
+    });
+    const topic = `tracking/device/${deviceUuid}/live`;
+    client.on('connect', () => { client.subscribe(topic, { qos: 0 }); });
+    client.on('message', (_topic, payload) => {
+      try {
+        const raw = JSON.parse(payload.toString());
+        const items = Array.isArray(raw) ? raw : [raw];
+        const livePoints = items
+          .filter((data) => data.latitude != null && data.longitude != null)
+          .map((data) => ({
+            id: -(Date.now() + Math.random()),
+            latitude: data.latitude, longitude: data.longitude,
+            speed: data.speed ?? 0, accuracy: data.accuracy ?? 0,
+            altitude: data.altitude ?? 0, bearing: data.bearing ?? 0,
+            availableSatellite: data.availableSatellite ?? 0,
+            connectedSatellite: data.connectedSatellite ?? 0,
+            deviceRdt: data.deviceRdt ?? '', gpsRdt: data.gpsRdt ?? '',
+            receivedAt: new Date().toISOString(),
+            uploadRetryCount: data.uploadRetryCount ?? 0,
+            provider: data.provider ?? '', versionNo: data.versionNo ?? '',
+            igStatus: data.igStatus ?? 0, reason: data.reason ?? '',
+            localPrimaryId: data.localPrimaryId ?? 0,
+          }));
+        if (livePoints.length > 0) {
+          setPoints((prev) => [...livePoints, ...prev]);
+          setHasLoaded(true);
+        }
+      } catch { /**/ }
+    });
+    trackingClientRef.current = client;
+    return () => { client.unsubscribe(topic); client.end(true); trackingClientRef.current = null; };
+  }, [deviceUuid]);
+
+  useEffect(() => {
+    if (!deviceUuid || initialHistoryDeviceRef.current === deviceUuid) return;
+    initialHistoryDeviceRef.current = deviceUuid;
+    setHasLoaded(false); setPlaybackActive(false); setPlaybackIdx(0); setPage(0);
+    fetchHistory(0);
+  }, [deviceUuid, fetchHistory]);
+
+  useEffect(() => { fetchGeofences(); fetchGeoTypes(); fetchGeoEvents(); }, [fetchGeofences, fetchGeoTypes, fetchGeoEvents]);
+
+  useEffect(() => {
+    if (window.innerWidth >= 768) return;
+    if (draw.phase === 'confirm') setActivePanel('geofences');
+    else if (!['idle', 'type-select'].includes(draw.phase)) setActivePanel(null);
+  }, [draw.phase]);
+
+  const handleMapClick = useCallback((lat, lng) => {
+    const s = drawRef.current;
+    if (s.phase === 'circle-center') {
+      setDraw((d) => ({ ...d, phase: 'circle-radius', circleCenter: [lat, lng] }));
+    } else if (s.phase === 'circle-radius' && s.circleCenter) {
+      const r = Math.round(metersBetween(s.circleCenter, [lat, lng]));
+      setDraw((d) => ({ ...d, phase: 'confirm', circleRadius: r, mousePos: null }));
+    } else if (s.phase === 'polygon' || s.phase === 'line') {
+      setDraw((d) => ({ ...d, polygonPts: [...d.polygonPts, [lat, lng]] }));
+    }
+  }, []);
+
+  const handleMouseMove = useCallback((lat, lng) => {
+    setDraw((d) => ({ ...d, mousePos: [lat, lng] }));
+  }, []);
+
+  function startDraw(type, geo) {
+    if (geo) {
+      setDraw({
+        ...BLANK_DRAW, phase: 'confirm', type: geo.type,
+        circleCenter: geo.centerLat && geo.centerLng ? [geo.centerLat, geo.centerLng] : null,
+        circleRadius: geo.radiusMeters ?? null,
+        polygonPts: parsePolygonPoints(geo.polygonPoints),
+        name: geo.name, editId: geo.id, bufferMeters: geo.bufferMeters ?? 0,
+      });
+    } else {
+      const phase = type === 'CIRCLE' ? 'circle-center' : type === 'POLYGON' ? 'polygon' : 'line';
+      setDraw({ ...BLANK_DRAW, phase, type });
+    }
+  }
+
+  function cancelDraw() { setDraw(BLANK_DRAW); }
+  function undoLastPolygonPt() { setDraw((d) => ({ ...d, polygonPts: d.polygonPts.slice(0, -1) })); }
+  function finishPolygon() { if (draw.polygonPts.length >= 3) setDraw((d) => ({ ...d, phase: 'confirm', mousePos: null })); }
+  function finishLine() { if (draw.polygonPts.length >= 2) setDraw((d) => ({ ...d, phase: 'confirm', mousePos: null })); }
+
+  async function saveGeofence() {
+    if (!deviceUuid || !draw.name.trim()) return;
+    setGeoSaving(true);
+    try {
+      const typeId = geoTypes.find((t) => t.name === draw.type)?.id ?? 0;
+      const req = {
+        name: draw.name, typeId,
+        centerLat: draw.circleCenter?.[0] ?? null,
+        centerLng: draw.circleCenter?.[1] ?? null,
+        radiusMeters: draw.circleRadius ?? null,
+        polygonPoints: draw.polygonPts.length > 0 ? JSON.stringify(draw.polygonPts) : null,
+        bufferMeters: draw.bufferMeters > 0 ? draw.bufferMeters : null,
+      };
+      const resp = draw.editId != null
+        ? await trackingService.updateGeofence(deviceUuid, draw.editId, req)
+        : await trackingService.createGeofence(deviceUuid, req);
+      if (resp.success) { cancelDraw(); fetchGeofences(draw.editId != null ? geoPage : 0); }
+    } catch { /**/ } finally { setGeoSaving(false); }
+  }
+
+  async function deleteGeofence(id) {
+    if (!deviceUuid) return;
+    setGeoDeleting(id);
+    try {
+      await trackingService.deleteGeofence(deviceUuid, id);
+      const remainingOnPage = geofences.length - 1;
+      const nextPage = remainingOnPage === 0 && geoPage > 0 ? geoPage - 1 : geoPage;
+      fetchGeofences(nextPage);
+    } catch { /**/ } finally { setGeoDeleting(null); }
+  }
+
+  async function handleBulkUpload() {
+    if (!deviceUuid || !uploadJson.trim()) return;
+    setUploading(true); setUploadMsg(null);
+    try {
+      const data = JSON.parse(uploadJson);
+      const pts = Array.isArray(data) ? data : [data];
+      const resp = await trackingService.bulkCreateTrackingPoints(deviceUuid, pts);
+      setUploadMsg({ ok: !!resp.success, text: resp.message ?? (resp.success ? 'Uploaded successfully' : 'Failed') });
+      if (resp.success) { setUploadJson(''); fetchHistory(0); }
+    } catch (e) {
+      setUploadMsg({ ok: false, text: `Parse error: ${e.message}` });
+    } finally { setUploading(false); }
+  }
+
+  const startConfigEditing = useCallback(() => {
+    setConfigForm(buildTrackingConfigDraft(configData));
+    setConfigEditing(true);
+  }, [configData]);
+
+  const cancelConfigEditing = useCallback(() => {
+    setConfigForm(buildTrackingConfigDraft(configData));
+    setConfigEditing(false);
+  }, [configData]);
+
+  const closeConfigModal = useCallback(() => {
+    if (configSaving) return;
+    setConfigModal(false); setConfigEditing(false);
+    setConfigForm(buildTrackingConfigDraft(configData));
+  }, [configData, configSaving]);
+
+  useEffect(() => {
+    if (!configModal) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const onKeyDown = (event) => {
+      if (event.key !== 'Escape' || configSaving) return;
+      if (configEditing) { cancelConfigEditing(); return; }
+      closeConfigModal();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => { document.body.style.overflow = previousOverflow; window.removeEventListener('keydown', onKeyDown); };
+  }, [cancelConfigEditing, closeConfigModal, configEditing, configModal, configSaving]);
+
+  async function openConfig() {
+    setConfigModal(true); setConfigEditing(false); setConfigForm({ ...BLANK_CONFIG }); setConfigData(null);
+    if (!deviceUuid) return;
+    setConfigLoading(true);
+    try {
+      const resp = await trackingService.getConfig(deviceUuid);
+      if (resp.success && resp.data) { setConfigData(resp.data); setConfigForm(buildTrackingConfigDraft(resp.data)); }
+      else setConfigData(null);
+    } catch { /**/ } finally { setConfigLoading(false); }
+  }
+
+  async function saveConfig() {
+    if (!deviceUuid) return;
+    setConfigSaving(true);
+    try {
+      await trackingService.updateConfig(deviceUuid, configForm);
+      setConfigEditing(false);
+      const resp = await trackingService.getConfig(deviceUuid);
+      if (resp.success && resp.data) { setConfigData(resp.data); setConfigForm(buildTrackingConfigDraft(resp.data)); }
+    } catch { /**/ } finally { setConfigSaving(false); }
+  }
+
+  async function exportAllToExcel() {
+    if (!deviceUuid) return;
+    setLoading(true);
+    try {
+      let all = []; let pg = 0, last = false;
+      while (!last) {
+        const resp = await trackingService.getHistory(deviceUuid, { from: fromDt, to: toDt, page: pg, size: 200 });
+        if (resp.success && resp.data) { all = all.concat(resp.data.content); last = resp.data.last; pg++; } else break;
+      }
+      const rows = all.map((p) => ({
+        ID: p.id, Latitude: p.latitude, Longitude: p.longitude, Speed: p.speed,
+        Accuracy: p.accuracy, Bearing: p.bearing, Altitude: p.altitude,
+        'Available Satellite': p.availableSatellite, 'Connected Satellite': p.connectedSatellite,
+        'Device RDT': p.deviceRdt, 'GPS RDT': p.gpsRdt, 'Received At': formatDateTimeWithMillis(p.receivedAt),
+        'Upload Retry': p.uploadRetryCount, Provider: p.provider, Version: p.versionNo,
+        'IG Status': p.igStatus, Reason: p.reason, 'Local Primary ID': p.localPrimaryId,
+      }));
+      const ws = XLSX.utils.json_to_sheet(rows);
+      const wb = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(wb, ws, 'History');
+      XLSX.writeFile(wb, `tracking_${deviceUuid}_${fromDt.slice(0,16)}_to_${toDt.slice(0,16)}.xlsx`);
+    } catch { /**/ } finally { setLoading(false); }
+  }
+
+  const liveRadius = draw.phase === 'circle-radius' && draw.circleCenter && draw.mousePos
+    ? Math.round(metersBetween(draw.circleCenter, draw.mousePos)) : null;
+  const previewRadius = draw.circleRadius ?? liveRadius ?? 0;
+  const rubberbandLine = (draw.phase === 'polygon' || draw.phase === 'line') && draw.polygonPts.length > 0 && draw.mousePos
+    ? [draw.polygonPts[draw.polygonPts.length - 1], draw.mousePos] : [];
+  const isDrawingActive = draw.phase !== 'idle' && draw.phase !== 'type-select';
+  const isTableExpanded = leftMode === 'table' || tableOpen;
+  const mapPaneClass = leftMode === 'table' ? 'hidden'
+    : leftMode === 'map' ? 'basis-0 flex-1 min-h-0'
+    : tableOpen ? 'basis-0 flex-[1.35] min-h-[24rem]'
+    : 'basis-0 flex-1 min-h-0';
+
+  const handleHistorySort = useCallback((field) => {
+    if (historySortField === field) { setHistorySortDirection((d) => d === 'asc' ? 'desc' : 'asc'); return; }
+    setHistorySortField(field);
+    setHistorySortDirection(field === 'localPrimaryId' ? 'desc' : 'asc');
+  }, [historySortField]);
+
+  const loadHistoryPage = useCallback((nextPage) => {
+    const maxPage = Math.max(effectiveTotalPages - 1, 0);
+    const clampedPage = effectiveTotalPages > 0 ? Math.max(0, Math.min(nextPage, maxPage)) : Math.max(0, nextPage);
+    setPage(clampedPage);
+    fetchHistory(clampedPage);
+  }, [effectiveTotalPages, fetchHistory]);
+
+  const historyPageCount = Math.max(effectiveTotalPages, 1);
+  const historyCurrentPageLabel = Math.min(page + 1, historyPageCount);
+  const canHistoryPrev = page > 0;
+  const canHistoryNext = page < historyPageCount - 1;
+
+  const historySummaryInline = hasLoaded && points.length > 0 ? (
+    <div className="min-w-0 flex flex-1 items-center gap-1.5 overflow-x-auto pb-0.5" onClick={(e) => e.stopPropagation()}>
+      {[
+        { label: 'Min', value: historySpeedStats.min != null ? `${historySpeedStats.min.toFixed(1)} km/h` : '-' },
+        { label: 'Avg', value: historySpeedStats.avg != null ? `${historySpeedStats.avg.toFixed(1)} km/h` : '-' },
+        { label: 'Max', value: historySpeedStats.max != null ? `${historySpeedStats.max.toFixed(1)} km/h` : '-' },
+      ].map((item) => (
+        <span key={item.label} className="inline-flex shrink-0 items-center gap-1 rounded-full border border-slate-200/80 bg-white/90 px-2.5 py-1 text-[11px] font-medium text-slate-600 shadow-sm dark:border-slate-700/60 dark:bg-slate-900/80 dark:text-slate-200">
+          <span className="text-[10px] font-semibold uppercase tracking-[0.14em] text-slate-400 dark:text-slate-500">{item.label}</span>
+          <span className="font-semibold text-slate-800 dark:text-slate-100">{item.value}</span>
+        </span>
+      ))}
+      {historyReasonStats.map((reason) => (
+        <span key={reason.label} className="inline-flex shrink-0 items-center gap-1.5 rounded-full border border-slate-200/80 bg-slate-50/95 px-2.5 py-1 text-[11px] font-medium text-slate-600 shadow-sm dark:border-slate-700/60 dark:bg-slate-800/85 dark:text-slate-200">
+          <span className="truncate">{reason.label}</span>
+          <span className="rounded-full bg-slate-200/90 px-1.5 py-0.5 text-[10px] font-semibold text-slate-700 dark:bg-slate-700 dark:text-slate-100">{reason.count}</span>
+        </span>
+      ))}
+    </div>
+  ) : null;
+
+  const mapElement = (
+    <div className="relative flex h-full min-h-0 w-full flex-1 overflow-hidden md:rounded-[28px] border border-white/70 bg-slate-950 shadow-[0_24px_80px_rgba(15,23,42,0.22)] ring-1 ring-slate-900/5 dark:border-slate-700/60 dark:ring-white/10">
+      <div className="pointer-events-none absolute inset-0 z-[450] bg-[radial-gradient(circle_at_top_left,rgba(59,130,246,0.22),transparent_34%),radial-gradient(circle_at_bottom_right,rgba(14,165,233,0.18),transparent_28%)]" />
+      {loading && (
+        <div className="absolute inset-0 z-[1000] flex items-center justify-center bg-black/40 pointer-events-none">
+          <Loader2 className="w-8 h-8 animate-spin text-blue-400" />
+        </div>
+      )}
+      {hasLoaded && points.length > 1 && !isDrawingActive && (
+        <div className={`pointer-events-auto absolute left-1/2 -translate-x-1/2 z-[1000] flex items-center gap-2 rounded-2xl border border-white/70 bg-white/96 px-4 py-2.5 shadow-xl backdrop-blur-md dark:border-slate-700/60 dark:bg-slate-950/94 ${leftMode === 'map' ? 'bottom-14' : 'bottom-4'}`}>
+          <button onClick={() => { setPlaybackActive(false); setPlaybackIdx(0); }} title="Reset" className="p-1.5 rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-700 transition-colors">
+            <SkipBack className="w-4 h-4" />
+          </button>
+          <button onClick={() => setPlaybackActive((v) => !v)} title={playbackActive ? 'Pause' : 'Play'} className="flex items-center justify-center w-9 h-9 rounded-xl bg-indigo-500 text-white hover:bg-indigo-600 transition-colors shadow-sm">
+            {playbackActive ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4 ml-0.5" />}
+          </button>
+          <div className="flex items-center gap-1">
+            {[1, 2, 5].map((s) => (
+              <button key={s} onClick={() => setPlaybackSpeed(s)} className={`text-xs font-bold px-2 py-1 rounded-lg transition-colors ${playbackSpeed === s ? 'bg-indigo-500 text-white' : 'text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-700'}`}>{s}×</button>
+            ))}
+          </div>
+          <div className="flex items-center gap-1.5 ml-1">
+            <div className="w-24 h-1.5 rounded-full bg-slate-200 dark:bg-slate-700 overflow-hidden">
+              <div className="h-full rounded-full bg-indigo-500 transition-all" style={{ width: `${points.length > 1 ? (playbackIdx / (points.length - 1)) * 100 : 0}%` }} />
+            </div>
+            <span className="text-[10px] text-slate-400 font-mono">{playbackIdx + 1}/{points.length}</span>
+          </div>
+        </div>
+      )}
+      {hasLoaded && leftMode === 'map' && (
+        <div className="pointer-events-auto absolute inset-x-0 bottom-0 z-[1000] hidden items-center justify-between gap-3 border-t border-white/60 bg-white/92 px-4 py-1.5 text-[11px] backdrop-blur-md dark:border-slate-700/60 dark:bg-slate-950/88 md:flex">
+          <div className="flex min-w-0 items-center gap-2 text-slate-500 dark:text-slate-400">
+            <span className="font-semibold text-slate-700 dark:text-slate-200">{totalElements.toLocaleString()}</span>
+            <span>records</span>
+            <span className="h-1 w-1 rounded-full bg-slate-300 dark:bg-slate-600" />
+            <span>Page {historyCurrentPageLabel} / {historyPageCount}</span>
+          </div>
+          <div className="flex items-center gap-1">
+            <button onClick={() => loadHistoryPage(page - 1)} disabled={!canHistoryPrev || loading} className="flex h-7 w-7 items-center justify-center rounded-lg border border-slate-200/80 bg-white/85 text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-800 disabled:opacity-35 dark:border-slate-700/60 dark:bg-slate-900/85 dark:text-slate-300 dark:hover:bg-slate-800"><ChevronLeft className="h-3.5 w-3.5" /></button>
+            <button onClick={() => loadHistoryPage(page + 1)} disabled={!canHistoryNext || loading} className="flex h-7 w-7 items-center justify-center rounded-lg border border-slate-200/80 bg-white/85 text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-800 disabled:opacity-35 dark:border-slate-700/60 dark:bg-slate-900/85 dark:text-slate-300 dark:hover:bg-slate-800"><ChevronRight className="h-3.5 w-3.5" /></button>
+          </div>
+        </div>
+      )}
+      {!['idle', 'type-select', 'confirm'].includes(draw.phase) && (
+        <div className="md:hidden pointer-events-auto absolute top-4 left-4 right-4 z-[1000] flex items-center gap-3 rounded-2xl border border-white/70 bg-white/96 px-4 py-3 shadow-xl backdrop-blur-md dark:border-slate-700/60 dark:bg-slate-950/94">
+          <MousePointer2 className="w-4 h-4 shrink-0" style={{ color: GEO_COLOR[draw.type] }} />
+          <p className="flex-1 text-xs font-medium text-slate-700 dark:text-slate-200">
+            {draw.phase === 'circle-center' && 'Tap to place center'}
+            {draw.phase === 'circle-radius' && `Tap to set radius${liveRadius ? ` · ${liveRadius.toLocaleString()}m` : ''}`}
+            {draw.phase === 'polygon' && `${draw.polygonPts.length} pts${draw.polygonPts.length >= 3 ? ' · Tap Done' : ' · need 3+'}`}
+            {draw.phase === 'line' && `${draw.polygonPts.length} wpts${draw.polygonPts.length >= 2 ? ' · Tap Done' : ' · need 2+'}`}
+          </p>
+          <div className="flex items-center gap-1.5">
+            {(draw.phase === 'polygon' || draw.phase === 'line') && (
+              <button onClick={draw.phase === 'polygon' ? finishPolygon : finishLine} disabled={(draw.phase === 'polygon' && draw.polygonPts.length < 3) || (draw.phase === 'line' && draw.polygonPts.length < 2)} className="rounded-xl px-3 py-1.5 text-xs font-bold text-white disabled:opacity-40" style={{ background: GEO_COLOR[draw.type] }}>Done</button>
+            )}
+            <button onClick={cancelDraw} className="rounded-xl px-2.5 py-1.5 text-xs font-bold text-red-500 bg-red-50 dark:bg-red-500/10"><X className="w-3.5 h-3.5" /></button>
+          </div>
+        </div>
+      )}
+      <MapContainer center={mapCenter} zoom={13} style={{ height: '100%', width: '100%' }} className="h-full w-full">
+        <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>' />
+        <InvalidateMapSize layoutKey={`${leftMode}-${tableOpen}`} />
+        <MapInteractionHandler draw={draw} onMapClick={handleMapClick} onMouseMove={handleMouseMove} />
+        {!isDrawingActive && <PointHoverHandler points={points} onHover={setHoverPoint} />}
+        <CenterOnLocation target={centerTarget} />
+        {polyline.length > 0 && !isDrawingActive && <FitBounds positions={polyline} trigger={fitBoundsKey} />}
+        {hoverPoint && !isDrawingActive && (
+          <Popup position={[hoverPoint.latitude, hoverPoint.longitude]} autoPan={false} closeButton={false} offset={[0, -4]}>
+            <PointPopup point={hoverPoint} color={speedColor(hoverPoint.speed ?? 0)} />
+          </Popup>
+        )}
+        {routeSegments.map((seg, i) => (
+          <Polyline key={`seg-${i}`} positions={seg.pts} pathOptions={{ color: seg.color, weight: 7, opacity: 0.92, lineCap: 'round', lineJoin: 'round' }} />
+        ))}
+        {arrowPoints.map((p) => (
+          <Marker key={`arr-${p.latitude.toFixed(5)}-${p.longitude.toFixed(5)}`} position={[p.latitude, p.longitude]} icon={bearingIcon(p.bearing ?? 0, speedColor(p.speed ?? 0))} zIndexOffset={-100} />
+        ))}
+        {selectedTrip && selectedTrip.startLat && (
+          <Marker position={[selectedTrip.startLat, selectedTrip.startLng]} icon={makePin('#6366f1')}>
+            <Popup autoPan={false}><div className="text-xs"><b>Trip Start</b><br />{new Date(selectedTrip.startTime).toLocaleString()}</div></Popup>
+          </Marker>
+        )}
+        {selectedTrip && selectedTrip.endLat && (
+          <Marker position={[selectedTrip.endLat, selectedTrip.endLng]} icon={makePin('#a855f7')}>
+            <Popup autoPan={false}><div className="text-xs"><b>Trip End</b><br />{selectedTrip.endTime ? new Date(selectedTrip.endTime).toLocaleString() : '—'}<br />{selectedTrip.totalDistanceMeters >= 1000 ? `${(selectedTrip.totalDistanceMeters/1000).toFixed(2)} km` : `${Math.round(selectedTrip.totalDistanceMeters)} m`}</div></Popup>
+          </Marker>
+        )}
+        {playbackPoint && (
+          <Marker position={[playbackPoint.latitude, playbackPoint.longitude]} icon={new L.DivIcon({ className: '', html: `<div style="width:18px;height:18px;border-radius:50%;background:#6366f1;border:3px solid white;box-shadow:0 0 0 3px #6366f180;"></div>`, iconSize: [18, 18], iconAnchor: [9, 9] })} zIndexOffset={1000}>
+            <Popup autoPan={false} closeButton={false}><PointPopup point={playbackPoint} color="#6366f1" /></Popup>
+          </Marker>
+        )}
+        {polyline.length > 0 && <Marker position={polyline[0]} icon={startPin}><Popup minWidth={220} maxWidth={280} autoPan={false}><PointPopup point={points[0]} color="#22c55e" label="START" /></Popup></Marker>}
+        {polyline.length > 1 && <Marker position={polyline[polyline.length - 1]} icon={endPin}><Popup minWidth={220} maxWidth={280} autoPan={false}><PointPopup point={points[points.length - 1]} color="#ef4444" label="END" /></Popup></Marker>}
+        {pinnedMarker && <PinnedMarkerLayer key={`${pinnedMarker.lat},${pinnedMarker.lng},${pinnedMarker.title}`} info={pinnedMarker} />}
+        {showGeoOnMap && geofences.filter((g) => g.active).map((g) => {
+          const color = GEO_COLOR[g.type] ?? '#f59e0b';
+          const popup = <Popup><GeofencePopup geo={g} onEdit={() => startDraw(g.type, g)} /></Popup>;
+          if (g.type === 'CIRCLE' && g.centerLat && g.centerLng && g.radiusMeters) return <LeafletCircle key={g.id} center={[g.centerLat, g.centerLng]} radius={g.radiusMeters + (g.bufferMeters ?? 0)} pathOptions={{ color, fillColor: color, fillOpacity: 0.12, weight: 2 }}>{popup}</LeafletCircle>;
+          if (g.type === 'POLYGON' && g.polygonPoints) { const pts = parsePolygonPoints(g.polygonPoints); if (pts.length >= 3) return <Polygon key={g.id} positions={pts} pathOptions={{ color, fillColor: color, fillOpacity: 0.12, weight: 2 }}>{popup}</Polygon>; }
+          if (g.type === 'LINE' && g.polygonPoints) { const pts = parsePolygonPoints(g.polygonPoints); if (pts.length >= 2) return <React.Fragment key={g.id}><Polyline positions={pts} pathOptions={{ color, weight: 12, opacity: 0.18 }} /><Polyline positions={pts} pathOptions={{ color, weight: 3, opacity: 0.9 }}>{popup}</Polyline></React.Fragment>; }
+          return null;
+        })}
+        {(() => {
+          const dc = GEO_COLOR[draw.type] ?? '#f59e0b';
+          return (
+            <>
+              {draw.circleCenter && <CircleMarker center={draw.circleCenter} radius={7} pathOptions={{ color: dc, fillColor: dc, fillOpacity: 1, weight: 2 }} />}
+              {draw.circleCenter && (draw.phase === 'circle-radius' || draw.phase === 'confirm') && previewRadius > 0 && <LeafletCircle center={draw.circleCenter} radius={previewRadius} pathOptions={{ color: dc, fillColor: dc, fillOpacity: 0.15, weight: 2, dashArray: draw.phase === 'circle-radius' ? '6 6' : undefined }} />}
+              {draw.phase === 'circle-radius' && draw.mousePos && <CircleMarker center={draw.mousePos} radius={4} pathOptions={{ color: dc, fillColor: 'white', fillOpacity: 0.9, weight: 2 }} />}
+              {(draw.phase === 'polygon' || draw.phase === 'line' || (draw.phase === 'confirm' && draw.type !== 'CIRCLE')) && draw.polygonPts.map((pt, i) => <CircleMarker key={i} center={pt} radius={i === 0 || i === draw.polygonPts.length - 1 ? 7 : 5} pathOptions={{ color: dc, fillColor: dc, fillOpacity: 1, weight: 2 }} />)}
+              {draw.polygonPts.length > 1 && (draw.phase === 'polygon' || draw.phase === 'line') && <Polyline positions={draw.polygonPts} color={dc} weight={2} dashArray="6 4" />}
+              {rubberbandLine.length === 2 && <Polyline positions={rubberbandLine} color={dc} weight={2} dashArray="4 4" opacity={0.7} />}
+              {draw.phase === 'confirm' && draw.type === 'POLYGON' && draw.polygonPts.length >= 3 && <Polygon positions={draw.polygonPts} pathOptions={{ color: dc, fillColor: dc, fillOpacity: 0.15, weight: 2 }} />}
+              {draw.phase === 'confirm' && draw.type === 'LINE' && draw.polygonPts.length >= 2 && <><Polyline positions={draw.polygonPts} pathOptions={{ color: dc, weight: 3, opacity: 0.9 }} /></>}
+            </>
+          );
+        })()}
+      </MapContainer>
+      {points.length > 0 && (
+        <div className="pointer-events-none absolute top-4 right-4 z-[1000] rounded-2xl border border-white/60 bg-white/92 px-3.5 py-2.5 shadow-xl shadow-slate-900/10 backdrop-blur-md dark:border-slate-700/60 dark:bg-slate-950/88">
+          <p className="text-[9px] font-bold uppercase tracking-[0.18em] text-slate-400 dark:text-slate-500 mb-1.5">Speed</p>
+          <div className="flex flex-col gap-1">
+            {[
+              { color: '#94a3b8', label: 'Stopped',    range: '0 km/h'   },
+              { color: '#22c55e', label: 'Very slow',  range: '< 10'     },
+              { color: '#84cc16', label: 'Slow',       range: '10 – 30'  },
+              { color: '#eab308', label: 'Moderate',   range: '30 – 60'  },
+              { color: '#f97316', label: 'Fast',       range: '60 – 90'  },
+              { color: '#ef4444', label: 'Very fast',  range: '90 – 120' },
+              { color: '#ff0000', label: 'Over-speed', range: '120+'     },
+            ].map(({ color, label, range }) => (
+              <span key={label} className="flex items-center gap-2 text-[10px] text-slate-600 dark:text-slate-300">
+                <span className="w-5 h-1.5 rounded-full shrink-0" style={{ background: color }} />
+                <span className="font-medium">{label}</span>
+                <span className="text-slate-400 dark:text-slate-500 ml-auto pl-2">{range}</span>
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+      {hasLoaded && polyline.length === 0 && !loading && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center pointer-events-none">
+          <div className="bg-white dark:bg-slate-800 border border-gray-200 dark:border-slate-700 shadow-lg rounded-xl px-6 py-4 text-center">
+            <MapPin className="w-8 h-8 text-gray-400 dark:text-slate-500 mx-auto mb-2 opacity-50" />
+            <p className="text-sm text-gray-500 dark:text-slate-400">No location data for selected range</p>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+
+  return (
+    <div className="flex h-screen flex-col overflow-hidden bg-[linear-gradient(180deg,#f8fbff_0%,#eef4ff_52%,#e9f1fb_100%)] dark:bg-[linear-gradient(180deg,#020617_0%,#0f172a_48%,#111827_100%)]">
+      {/* Header */}
+      <div className="z-50 shrink-0 border-b border-slate-200/70 bg-white/80 px-4 py-3 md:px-5 md:py-4 backdrop-blur-xl dark:border-slate-700/50 dark:bg-slate-950/72">
+        <div className="flex items-center gap-3">
+          <button onClick={() => navigate(-1)} className="rounded-2xl border border-white/70 bg-white/80 p-2.5 text-slate-500 shadow-sm transition-colors hover:bg-white hover:text-slate-900 dark:border-slate-700/60 dark:bg-slate-900/70 dark:text-slate-400 dark:hover:bg-slate-900 dark:hover:text-slate-100"><ArrowLeft className="w-5 h-5" /></button>
+          <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-[linear-gradient(135deg,#0f172a_0%,#2563eb_50%,#22d3ee_100%)] shadow-[0_18px_45px_rgba(37,99,235,0.28)]"><MapPin className="h-5 w-5 text-white" /></div>
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2">
+              <p className="truncate text-sm font-semibold text-slate-950 dark:text-slate-100">{deviceUuid}</p>
+              <span className="rounded-full border border-sky-500/20 bg-sky-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-sky-700 dark:text-sky-300">Tracking</span>
+            </div>
+            <p className="hidden md:block text-xs text-slate-500 dark:text-slate-400">Live route intelligence, geofence tooling, and export-grade location history</p>
+          </div>
+          <button onClick={openConfig} title="Tracking configuration" className="rounded-2xl border border-white/70 bg-white/80 p-2.5 text-slate-500 shadow-sm transition-colors hover:bg-white hover:text-blue-600 dark:border-slate-700/60 dark:bg-slate-900/70 dark:text-slate-400 dark:hover:bg-slate-900 dark:hover:text-blue-400"><Settings className="w-5 h-5" /></button>
+        </div>
+      </div>
+
+      {/* Top Options Toolbar */}
+      <div className="max-md:hidden shrink-0 z-40 border-b border-slate-200/70 bg-white/80 px-5 py-2 backdrop-blur-xl dark:border-slate-700/50 dark:bg-slate-950/72">
+        <div className="flex items-center gap-2">
+          <button onClick={() => setActivePanel(activePanel === 'history' ? null : 'history')} className={`flex items-center gap-2 rounded-xl px-3.5 py-2 text-xs font-semibold transition-colors border ${activePanel === 'history' ? 'bg-blue-600 text-white border-blue-600 shadow-md shadow-blue-500/20' : 'bg-white/80 dark:bg-slate-800/60 border-slate-200 dark:border-slate-700/60 text-slate-600 dark:text-slate-300 hover:bg-blue-50 dark:hover:bg-slate-700/50 hover:text-blue-600 dark:hover:text-blue-300'}`}>
+            <Sheet className="w-3.5 h-3.5" />History
+            {hasLoaded && totalElements > 0 && <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold ${activePanel === 'history' ? 'bg-white/25 text-white' : 'bg-blue-500/15 text-blue-600 dark:text-blue-400'}`}>{totalElements.toLocaleString()}</span>}
+          </button>
+          <button onClick={() => setActivePanel(activePanel === 'geofences' ? null : 'geofences')} className={`flex items-center gap-2 rounded-xl px-3.5 py-2 text-xs font-semibold transition-colors border ${activePanel === 'geofences' ? 'bg-amber-500 text-white border-amber-500 shadow-md shadow-amber-500/20' : 'bg-white/80 dark:bg-slate-800/60 border-slate-200 dark:border-slate-700/60 text-slate-600 dark:text-slate-300 hover:bg-amber-50 dark:hover:bg-slate-700/50 hover:text-amber-600 dark:hover:text-amber-300'}`}>
+            <Shield className="w-3.5 h-3.5" />Geofences
+            {geoTotal > 0 && <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold ${activePanel === 'geofences' ? 'bg-white/25 text-white' : 'bg-amber-500/15 text-amber-600 dark:text-amber-400'}`}>{geoTotal}</span>}
+          </button>
+          <button onClick={() => setActivePanel(activePanel === 'events' ? null : 'events')} className={`flex items-center gap-2 rounded-xl px-3.5 py-2 text-xs font-semibold transition-colors border ${activePanel === 'events' ? 'bg-blue-500 text-white border-blue-500 shadow-md shadow-blue-500/20' : 'bg-white/80 dark:bg-slate-800/60 border-slate-200 dark:border-slate-700/60 text-slate-600 dark:text-slate-300 hover:bg-blue-50 dark:hover:bg-slate-700/50 hover:text-blue-600 dark:hover:text-blue-300'}`}>
+            <Activity className="w-3.5 h-3.5" />Events
+            {geoEventsTotal > 0 && <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold ${activePanel === 'events' ? 'bg-white/25 text-white' : 'bg-blue-500/15 text-blue-600 dark:text-blue-400'}`}>{geoEventsTotal}</span>}
+          </button>
+          <button onClick={() => setActivePanel(activePanel === 'trips' ? null : 'trips')} className={`flex items-center gap-2 rounded-xl px-3.5 py-2 text-xs font-semibold transition-colors border ${activePanel === 'trips' ? 'bg-indigo-600 text-white border-indigo-600 shadow-md shadow-indigo-500/20' : 'bg-white/80 dark:bg-slate-800/60 border-slate-200 dark:border-slate-700/60 text-slate-600 dark:text-slate-300 hover:bg-indigo-50 dark:hover:bg-slate-700/50 hover:text-indigo-600 dark:hover:text-indigo-300'}`}>
+            <Route className="w-3.5 h-3.5" />Trips
+            {tripsTotal > 0 && <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold ${activePanel === 'trips' ? 'bg-white/25 text-white' : 'bg-indigo-500/15 text-indigo-600 dark:text-indigo-400'}`}>{tripsTotal}</span>}
+          </button>
+          <button onClick={() => setActivePanel(activePanel === 'alerts' ? null : 'alerts')} className={`flex items-center gap-2 rounded-xl px-3.5 py-2 text-xs font-semibold transition-colors border ${activePanel === 'alerts' ? 'bg-orange-500 text-white border-orange-500 shadow-md shadow-orange-500/20' : 'bg-white/80 dark:bg-slate-800/60 border-slate-200 dark:border-slate-700/60 text-slate-600 dark:text-slate-300 hover:bg-orange-50 dark:hover:bg-slate-700/50 hover:text-orange-600 dark:hover:text-orange-300'}`}>
+            <AlertTriangle className="w-3.5 h-3.5" />Alerts
+            {trackEventsTotal > 0 && <span className={`px-1.5 py-0.5 rounded-full text-[10px] font-bold ${activePanel === 'alerts' ? 'bg-white/25 text-white' : 'bg-orange-500/15 text-orange-600 dark:text-orange-400'}`}>{trackEventsTotal}</span>}
+          </button>
+          <div className="flex-1" />
+          <div className="flex items-center gap-1 rounded-2xl border border-slate-200/70 dark:border-slate-700/60 bg-white/86 dark:bg-slate-950/84 p-1">
+            <button onClick={() => setLeftMode('map')} title="Full map" className={`flex items-center gap-1 rounded-xl px-3 py-1.5 text-xs font-semibold transition-colors ${leftMode === 'map' ? 'bg-[linear-gradient(135deg,#0f172a_0%,#2563eb_54%,#38bdf8_100%)] text-white shadow-lg shadow-blue-500/25' : 'text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800/70'}`}><Maximize2 className="w-3.5 h-3.5" /><span>Map</span></button>
+            <button onClick={() => setLeftMode('split')} title="Split view" className={`flex items-center gap-1 rounded-xl px-3 py-1.5 text-xs font-semibold transition-colors ${leftMode === 'split' ? 'bg-[linear-gradient(135deg,#0f172a_0%,#2563eb_54%,#38bdf8_100%)] text-white shadow-lg shadow-blue-500/25' : 'text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800/70'}`}><LayoutPanelTop className="w-3.5 h-3.5" /><span>Split</span></button>
+            <button onClick={() => setLeftMode('table')} title="Full table" className={`flex items-center gap-1 rounded-xl px-3 py-1.5 text-xs font-semibold transition-colors ${leftMode === 'table' ? 'bg-[linear-gradient(135deg,#0f172a_0%,#2563eb_54%,#38bdf8_100%)] text-white shadow-lg shadow-blue-500/25' : 'text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800/70'}`}><Sheet className="w-3.5 h-3.5" /><span>Table</span></button>
+          </div>
+        </div>
+      </div>
+
+      {/* Body */}
+      <div className="flex flex-col md:flex-row min-h-0 flex-1 md:gap-4 overflow-hidden md:px-4 md:pt-3 md:pb-4 pb-[60px] md:pb-0">
+        <div className="flex min-w-0 flex-1 flex-col overflow-hidden md:gap-4">
+          <div className={`relative flex min-h-0 min-w-0 overflow-hidden transition-all duration-300 ease-out ${mapPaneClass}`}>
+            {mapElement}
+          </div>
+
+          {/* Table section */}
+          <div className={`max-md:hidden flex flex-col overflow-hidden rounded-[28px] border border-white/70 bg-white/75 shadow-[0_22px_70px_rgba(15,23,42,0.10)] backdrop-blur-sm dark:border-slate-700/60 dark:bg-slate-950/55 transition-all duration-300 ease-out ${leftMode === 'map' ? 'hidden' : leftMode === 'table' ? 'flex-1 min-h-0' : tableOpen ? 'flex-[0.95] min-h-0' : 'flex-none h-12'}`}>
+            <div className={`shrink-0 select-none border-b border-slate-200/70 bg-[linear-gradient(180deg,rgba(255,255,255,0.88),rgba(241,245,249,0.7))] px-4 py-3 dark:border-slate-700/50 dark:bg-[linear-gradient(180deg,rgba(15,23,42,0.82),rgba(15,23,42,0.66))] ${leftMode === 'split' ? 'cursor-pointer' : ''}`} onClick={() => leftMode === 'split' && setTableOpen((v) => !v)}>
+              <div className="flex items-center justify-between gap-3">
+                <div className="flex min-w-0 flex-1 items-center gap-3">
+                  <div className="flex shrink-0 items-center gap-2">
+                    <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-sky-500/10 text-sky-600 dark:text-sky-300">
+                      <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M3 15h18M9 3v18"/></svg>
+                    </div>
+                    <div>
+                      <span className="block text-xs font-semibold uppercase tracking-[0.18em] text-slate-600 dark:text-slate-300">Excel View</span>
+                      {hasLoaded && <span className="text-[11px] text-slate-500 dark:text-slate-400">{totalElements.toLocaleString()} route records</span>}
+                    </div>
+                  </div>
+                  <div className="hidden min-w-0 flex-1 md:flex">{historySummaryInline}</div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button onClick={(e) => { e.stopPropagation(); setLeftMode((m) => m === 'table' ? 'split' : 'table'); }} title={leftMode === 'table' ? 'Exit fullscreen' : 'Fullscreen table'} className="rounded-xl p-1.5 text-slate-400 transition-colors hover:bg-sky-500/10 hover:text-sky-600 dark:text-slate-500 dark:hover:bg-slate-800 dark:hover:text-sky-300">
+                    {leftMode === 'table' ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
+                  </button>
+                  {leftMode === 'split' && <ChevronRight className={`h-4 w-4 text-slate-400 transition-transform duration-200 ${tableOpen ? 'rotate-90' : '-rotate-90'}`} />}
+                </div>
+              </div>
+              <div className="mt-2 flex md:hidden">{historySummaryInline}</div>
+            </div>
+            {isTableExpanded && (
+              <>
+                <div className="flex-1 overflow-auto min-h-0">
+                  {loading && <div className="flex items-center justify-center py-10"><Loader2 className="w-7 h-7 animate-spin text-blue-400" /></div>}
+                  {!loading && hasLoaded && points.length === 0 && <div className="flex flex-col items-center justify-center py-10 text-slate-400 dark:text-slate-500"><MapPin className="w-8 h-8 mb-2 opacity-30" /><p className="text-sm">No location data for selected range</p></div>}
+                  {!loading && points.length > 0 && (
+                    <table className="w-full text-left text-xs">
+                      <thead className="sticky top-0 bg-[linear-gradient(180deg,rgba(248,250,252,0.96),rgba(241,245,249,0.92))] text-slate-500 uppercase tracking-wider dark:bg-[linear-gradient(180deg,rgba(15,23,42,0.96),rgba(15,23,42,0.92))] dark:text-slate-400">
+                        <tr>
+                          {HISTORY_TABLE_COLUMNS.map((column) => (
+                            <th key={column.label} scope="col" className={`whitespace-nowrap border-b border-slate-200/70 px-3 py-2.5 dark:border-slate-700/50 ${column.className ?? ''}`}>
+                              {column.sortField ? (
+                                <button type="button" onClick={() => handleHistorySort(column.sortField)} className="group inline-flex items-center gap-1.5 font-semibold transition-colors hover:text-slate-700 dark:hover:text-slate-200">
+                                  <span>{column.label}</span>
+                                  <span className="text-[11px] text-slate-400 transition-colors group-hover:text-slate-600 dark:group-hover:text-slate-300">{historySortField === column.sortField ? (historySortDirection === 'asc' ? '↑' : '↓') : '↕'}</span>
+                                </button>
+                              ) : <span className="font-semibold">{column.label}</span>}
+                            </th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100/90 dark:divide-slate-700/30">
+                        {sortedHistoryPoints.map((p, i) => (
+                          <tr key={`${p.id}-${p.localPrimaryId ?? 'na'}-${i}`} className="bg-white/80 transition-colors hover:bg-sky-50/60 dark:bg-transparent dark:hover:bg-slate-800/40">
+                            <td className="px-3 py-2 text-slate-400 dark:text-slate-500">{page * pageSize + i + 1}</td>
+                            <td className="px-3 py-2 font-mono text-slate-400 dark:text-slate-500">{p.id > 0 ? p.id : '-'}</td>
+                            <td className="px-3 py-2 font-mono text-slate-600 dark:text-slate-300">{p.localPrimaryId || '-'}</td>
+                            <td className="whitespace-nowrap px-3 py-2 text-slate-600 dark:text-slate-300">{formatDateTimeWithMillis(p.receivedAt)}</td>
+                            <td className="whitespace-nowrap px-3 py-2 text-slate-600 dark:text-slate-300">{p.deviceRdt || '-'}</td>
+                            <td className="whitespace-nowrap px-3 py-2 text-slate-600 dark:text-slate-300">{p.gpsRdt || '-'}</td>
+                            <td className="px-3 py-2 font-mono text-slate-800 dark:text-slate-200">{p.latitude?.toFixed(6)}</td>
+                            <td className="px-3 py-2 font-mono text-slate-800 dark:text-slate-200">{p.longitude?.toFixed(6)}</td>
+                            <td className="px-3 py-2 text-slate-600 dark:text-slate-300">{p.speed != null ? p.speed.toFixed(1) : '-'}</td>
+                            <td className="px-3 py-2 text-slate-600 dark:text-slate-300">{p.accuracy != null ? `±${p.accuracy.toFixed(0)}` : '-'}</td>
+                            <td className="px-3 py-2 text-slate-600 dark:text-slate-300">{p.altitude != null ? p.altitude.toFixed(0) : '-'}</td>
+                            <td className="px-3 py-2 text-slate-600 dark:text-slate-300">{p.bearing != null ? `${p.bearing.toFixed(1)}°` : '-'}</td>
+                            <td className="px-3 py-2 text-slate-600 dark:text-slate-300">{p.connectedSatellite}/{p.availableSatellite}</td>
+                            <td className="px-3 py-2 text-slate-600 dark:text-slate-300">{p.provider || '-'}</td>
+                            <td className="px-3 py-2 text-slate-600 dark:text-slate-300">{p.versionNo || '-'}</td>
+                            <td className="px-3 py-2 text-slate-600 dark:text-slate-300">{p.uploadRetryCount ?? '-'}</td>
+                            <td className="px-3 py-1.5"><span className={`px-1.5 py-0.5 rounded text-xs font-medium ${p.igStatus === 1 ? 'bg-green-500/15 text-green-600 dark:text-green-400' : 'bg-gray-100 dark:bg-slate-700 text-gray-500 dark:text-slate-400'}`}>{p.igStatus === 1 ? 'ON' : 'OFF'}</span></td>
+                            <td className="max-w-[160px] truncate px-3 py-2 text-slate-500 dark:text-slate-400">{p.reason || '-'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+                {hasLoaded && (
+                  <div className="shrink-0 flex items-center justify-between gap-3 border-t border-slate-200/70 bg-white/92 px-4 py-1.5 text-[11px] backdrop-blur-sm dark:border-slate-700/50 dark:bg-slate-950/82">
+                    <div className="flex min-w-0 items-center gap-2 text-slate-500 dark:text-slate-400">
+                      <span className="font-semibold text-slate-700 dark:text-slate-200">{totalElements.toLocaleString()}</span><span>records</span>
+                      <span className="h-1 w-1 rounded-full bg-slate-300 dark:bg-slate-600" />
+                      <span>Page {historyCurrentPageLabel} / {historyPageCount}</span>
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <button onClick={() => loadHistoryPage(page - 1)} disabled={!canHistoryPrev || loading} className="flex h-7 w-7 items-center justify-center rounded-lg border border-slate-200/80 bg-white/85 text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-800 disabled:opacity-35 dark:border-slate-700/60 dark:bg-slate-900/85 dark:text-slate-300 dark:hover:bg-slate-800"><ChevronLeft className="h-3.5 w-3.5" /></button>
+                      <button onClick={() => loadHistoryPage(page + 1)} disabled={!canHistoryNext || loading} className="flex h-7 w-7 items-center justify-center rounded-lg border border-slate-200/80 bg-white/85 text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-800 disabled:opacity-35 dark:border-slate-700/60 dark:bg-slate-900/85 dark:text-slate-300 dark:hover:bg-slate-800"><ChevronRight className="h-3.5 w-3.5" /></button>
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Mobile Bottom Nav */}
+      <div className={`md:hidden fixed bottom-0 inset-x-0 z-[200] shrink-0 ${activePanel ? 'hidden' : 'flex'} items-stretch border-t border-gray-200/80 dark:border-slate-700/60 bg-white dark:bg-slate-950 shadow-[0_-4px_20px_rgba(0,0,0,0.10)]`} style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}>
+        {[
+          { id: null,        Icon: MapPin,        label: 'Map',     badge: null },
+          { id: 'history',   Icon: Sheet,         label: 'History', badge: hasLoaded && totalElements > 0 ? totalElements : null },
+          { id: 'geofences', Icon: Shield,        label: 'Fences',  badge: geoTotal > 0 ? geoTotal : null },
+          { id: 'events',    Icon: Activity,      label: 'Events',  badge: geoEventsTotal > 0 ? geoEventsTotal : null },
+          { id: 'trips',     Icon: Route,         label: 'Trips',   badge: tripsTotal > 0 ? tripsTotal : null },
+          { id: 'alerts',    Icon: AlertTriangle, label: 'Alerts',  badge: trackEventsTotal > 0 ? trackEventsTotal : null },
+        ].map(({ id, Icon, label, badge }) => {
+          const isActive = activePanel === id;
+          return (
+            <button key={label} onClick={() => setActivePanel(id)} className={`flex flex-1 flex-col items-center justify-center gap-0.5 py-2.5 relative transition-colors min-w-0 ${isActive ? 'text-blue-600 dark:text-blue-400' : 'text-gray-400 dark:text-slate-500'}`}>
+              {isActive && <span className="absolute top-0 inset-x-0 h-0.5 rounded-full bg-blue-600 dark:bg-blue-400" />}
+              <div className="relative">
+                <Icon className={`w-5 h-5 transition-transform duration-150 ${isActive ? 'scale-110' : ''}`} />
+                {badge != null && <span className="absolute -top-1.5 -right-2 min-w-[14px] h-[14px] flex items-center justify-center bg-blue-500 text-white text-[8px] font-bold rounded-full px-0.5">{badge > 99 ? '99+' : badge}</span>}
+              </div>
+              <span className={`text-[9px] font-semibold tracking-wide truncate w-full text-center px-0.5 ${isActive ? 'text-blue-600 dark:text-blue-400' : ''}`}>{label}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Universal panel overlay */}
+      {activePanel && (
+        <div className="fixed inset-0 z-[9999] flex flex-col md:flex-row" onClick={() => setActivePanel(null)}>
+          <div className="flex-1 bg-black/50 md:bg-black/30 backdrop-blur-sm md:backdrop-blur-sm" />
+          <div className="w-full md:max-w-2xl flex flex-col bg-white dark:bg-slate-900 shadow-[0_-8px_60px_rgba(15,23,42,0.22)] md:shadow-[0_0_80px_rgba(15,23,42,0.25)] rounded-t-[28px] md:rounded-none md:border-l border-slate-200/70 dark:border-slate-700/60 animate-in md:slide-in-from-right-8 slide-in-from-bottom-8 duration-300 max-h-[88vh] md:max-h-full" style={{ paddingBottom: 'env(safe-area-inset-bottom)' }} onClick={(e) => e.stopPropagation()}>
+            <div className="md:hidden flex justify-center pt-3 pb-1 shrink-0"><div className="w-10 h-1 rounded-full bg-slate-200 dark:bg-slate-700" /></div>
+            {/* Panel header */}
+            <div className="shrink-0 flex items-center gap-3 px-5 md:px-6 py-3.5 md:py-4 border-b border-slate-200/70 dark:border-slate-700/50 bg-white/90 dark:bg-slate-900/90 backdrop-blur-md">
+              {activePanel === 'history' && <><Sheet className="w-5 h-5 text-blue-500" /><h2 className="text-base font-bold text-slate-900 dark:text-slate-100 flex-1">History Filters</h2></>}
+              {activePanel === 'geofences' && <><Shield className="w-5 h-5 text-amber-500" /><h2 className="text-base font-bold text-slate-900 dark:text-slate-100 flex-1">Geofences</h2>{geoTotal > 0 && <span className="text-xs bg-amber-500/15 text-amber-600 dark:text-amber-400 px-2.5 py-0.5 rounded-full font-semibold">{geoTotal}</span>}</>}
+              {activePanel === 'events' && <><Activity className="w-5 h-5 text-blue-500" /><h2 className="text-base font-bold text-slate-900 dark:text-slate-100 flex-1">Geofence Events</h2>{geoEventsTotal > 0 && <span className="text-xs bg-blue-500/15 text-blue-600 dark:text-blue-400 px-2.5 py-0.5 rounded-full font-semibold">{geoEventsTotal}</span>}</>}
+              {activePanel === 'trips' && <><Route className="w-5 h-5 text-indigo-500" /><h2 className="text-base font-bold text-slate-900 dark:text-slate-100 flex-1">Trips</h2>{tripsTotal > 0 && <span className="text-xs bg-indigo-500/15 text-indigo-600 dark:text-indigo-400 px-2.5 py-0.5 rounded-full font-semibold">{tripsTotal}</span>}</>}
+              {activePanel === 'alerts' && <><AlertTriangle className="w-5 h-5 text-orange-500" /><h2 className="text-base font-bold text-slate-900 dark:text-slate-100 flex-1">Tracking Alerts</h2>{trackEventsTotal > 0 && <span className="text-xs bg-orange-500/15 text-orange-600 dark:text-orange-400 px-2.5 py-0.5 rounded-full font-semibold">{trackEventsTotal}</span>}</>}
+              <button onClick={() => setActivePanel(null)} className="ml-2 p-2 rounded-xl text-slate-400 hover:text-slate-700 dark:hover:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"><X className="w-5 h-5" /></button>
+            </div>
+
+            {/* History panel */}
+            {activePanel === 'history' && (
+              <div className="flex flex-col flex-1 overflow-hidden min-h-0">
+                <div className="shrink-0 px-6 py-5 space-y-4 border-b border-slate-200/70 dark:border-slate-700/50">
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="text-xs font-semibold text-slate-500 dark:text-slate-400 block mb-1.5 uppercase tracking-wide">From</label>
+                      <input type="datetime-local" step="1" value={fromDt} onChange={(e) => setFromDt(e.target.value)} className="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded-xl px-3 py-2.5 text-sm text-slate-800 dark:text-slate-200 focus:outline-none focus:border-blue-500" />
+                    </div>
+                    <div>
+                      <label className="text-xs font-semibold text-slate-500 dark:text-slate-400 block mb-1.5 uppercase tracking-wide">To</label>
+                      <input type="datetime-local" step="1" value={toDt} onChange={(e) => setToDt(e.target.value)} className="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded-xl px-3 py-2.5 text-sm text-slate-800 dark:text-slate-200 focus:outline-none focus:border-blue-500" />
+                    </div>
+                  </div>
+                  <div className="flex gap-3">
+                    <button onClick={() => loadHistoryPage(0)} disabled={loading} className="flex-1 flex items-center justify-center gap-2 py-2.5 bg-blue-600 text-white rounded-xl text-sm font-semibold hover:bg-blue-700 transition-colors disabled:opacity-50 shadow-sm">
+                      {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />} Search History
+                    </button>
+                    <button onClick={exportAllToExcel} disabled={loading || !hasLoaded || totalElements === 0} className="flex items-center gap-2 px-4 py-2.5 bg-green-600/15 border border-green-500/30 text-green-700 dark:text-green-400 rounded-xl text-sm font-semibold hover:bg-green-600/25 transition-colors disabled:opacity-50"><Download className="w-4 h-4" /> Excel</button>
+                    <button onClick={() => { setUploadModal(true); setUploadMsg(null); setUploadJson(''); }} className="flex items-center gap-2 px-4 py-2.5 bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 rounded-xl text-sm font-semibold hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors"><Upload className="w-4 h-4" /></button>
+                  </div>
+                  {hasLoaded && totalElements > 0 && <p className="text-sm text-slate-500 dark:text-slate-400"><span className="font-semibold text-slate-700 dark:text-slate-200">{totalElements.toLocaleString()}</span> route records</p>}
+                  {historySummaryInline}
+                </div>
+                <div className="flex-1 overflow-y-auto min-h-0">
+                  {loading && <div className="flex items-center justify-center py-16"><Loader2 className="w-8 h-8 animate-spin text-blue-400" /></div>}
+                  {!loading && hasLoaded && points.length === 0 && <div className="flex flex-col items-center justify-center py-16 text-slate-400"><MapPin className="w-10 h-10 mb-3 opacity-25" /><p className="text-sm">No location data for selected range</p></div>}
+                  <div className="divide-y divide-slate-100 dark:divide-slate-700/30">
+                    {sortedHistoryPoints.map((p, i) => (
+                      <div key={`${p.id}-${p.localPrimaryId ?? 'na'}-${i}`} className="flex items-start gap-3 px-6 py-3.5 hover:bg-slate-50 dark:hover:bg-slate-800/40 transition-colors cursor-pointer"
+                        onClick={() => { setCenterTarget([p.latitude, p.longitude]); setPinnedMarker({ lat: p.latitude, lng: p.longitude, title: p.reason || 'Location Point', detail: `${p.speed != null ? p.speed.toFixed(1) + ' km/h · ' : ''}${formatDateTimeWithMillis(p.receivedAt)}`, color: getPointColor(p.reason) }); setActivePanel(null); }}>
+                        <div className="w-2.5 h-2.5 rounded-full mt-1.5 shrink-0" style={{ background: getPointColor(p.reason) }} />
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center justify-between gap-2">
+                            <p className="text-sm font-semibold text-slate-800 dark:text-slate-200 truncate">{p.reason || 'Location point'}</p>
+                            <span className="text-xs text-slate-400 shrink-0">{p.speed != null ? `${p.speed.toFixed(1)} km/h` : ''}</span>
+                          </div>
+                          <p className="text-xs font-mono text-slate-400 dark:text-slate-500">{p.latitude.toFixed(6)}, {p.longitude.toFixed(6)}</p>
+                          <p className="text-xs text-slate-400 mt-0.5">{formatDateTimeWithMillis(p.receivedAt)}</p>
+                        </div>
+                        <span className="text-[10px] text-slate-300 dark:text-slate-600 shrink-0 pt-1">#{page * pageSize + i + 1}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                {hasLoaded && (
+                  <div className="shrink-0 flex items-center justify-between gap-3 border-t border-slate-200/70 bg-white/92 px-4 py-2 text-xs backdrop-blur-sm dark:border-slate-700/50 dark:bg-slate-950/82">
+                    <div className="flex min-w-0 items-center gap-2 text-slate-500 dark:text-slate-400">
+                      <span className="font-semibold text-slate-700 dark:text-slate-200">{totalElements.toLocaleString()}</span><span>records</span>
+                      <span className="h-1 w-1 rounded-full bg-slate-300 dark:bg-slate-600" />
+                      <span>Page {historyCurrentPageLabel} / {historyPageCount}</span>
+                    </div>
+                    <div className="flex items-center gap-1">
+                      <button onClick={() => loadHistoryPage(page - 1)} disabled={!canHistoryPrev || loading} className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200/80 bg-white/85 text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-800 disabled:opacity-35 dark:border-slate-700/60 dark:bg-slate-900/85 dark:text-slate-300 dark:hover:bg-slate-800"><ChevronLeft className="h-4 w-4" /></button>
+                      <button onClick={() => loadHistoryPage(page + 1)} disabled={!canHistoryNext || loading} className="flex h-8 w-8 items-center justify-center rounded-lg border border-slate-200/80 bg-white/85 text-slate-500 transition-colors hover:bg-slate-100 hover:text-slate-800 disabled:opacity-35 dark:border-slate-700/60 dark:bg-slate-900/85 dark:text-slate-300 dark:hover:bg-slate-800"><ChevronRight className="h-4 w-4" /></button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Geofences panel */}
+            {activePanel === 'geofences' && (
+              <div className="flex flex-col flex-1 overflow-hidden min-h-0">
+                <div className="shrink-0 flex items-center gap-2 px-6 py-3 border-b border-slate-200/70 dark:border-slate-700/50 bg-slate-50 dark:bg-slate-800/40">
+                  <button onClick={() => setShowGeoOnMap((v) => !v)} className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors ${showGeoOnMap ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400 border border-amber-500/30' : 'bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400 border border-transparent'}`}><Shield className="w-3.5 h-3.5" /> {showGeoOnMap ? 'Visible on map' : 'Hidden from map'}</button>
+                  <button onClick={() => fetchGeofences(geoPage)} disabled={geoLoading} className="p-2 rounded-lg text-slate-500 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors">{geoLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}</button>
+                  <div className="flex-1" />
+                  {draw.phase === 'idle' && <button onClick={() => setDraw((d) => ({ ...d, phase: 'type-select' }))} className="flex items-center gap-2 px-4 py-2 bg-amber-500 text-white rounded-xl text-sm font-semibold hover:bg-amber-600 transition-colors shadow-sm"><Plus className="w-4 h-4" /> Add Geofence</button>}
+                  {draw.phase !== 'idle' && <button onClick={cancelDraw} className="flex items-center gap-2 px-4 py-2 bg-red-500/15 border border-red-500/30 text-red-600 dark:text-red-400 rounded-xl text-sm font-semibold hover:bg-red-500/25 transition-colors"><X className="w-4 h-4" /> Cancel Drawing</button>}
+                </div>
+                {draw.phase === 'type-select' && (
+                  <div className="shrink-0 px-6 py-5 border-b border-slate-200/70 dark:border-slate-700/50 space-y-3">
+                    <p className="text-sm text-slate-500 dark:text-slate-400">Select a shape to draw on the map</p>
+                    <div className="grid grid-cols-3 gap-3">
+                      <button onClick={() => startDraw('CIRCLE')} className="flex flex-col items-center gap-2 py-5 bg-amber-500/10 border border-amber-500/30 rounded-2xl text-amber-500 hover:bg-amber-500/20 active:scale-95 transition-all"><div className="w-9 h-9 rounded-full border-2 border-amber-500" /><span className="text-sm font-semibold">Circle</span></button>
+                      <button onClick={() => startDraw('POLYGON')} className="flex flex-col items-center gap-2 py-5 bg-purple-500/10 border border-purple-500/30 rounded-2xl text-purple-500 hover:bg-purple-500/20 active:scale-95 transition-all"><svg width="36" height="36" viewBox="0 0 32 32"><polygon points="16,2 30,22 24,30 8,30 2,22" fill="none" stroke="#a855f7" strokeWidth="2.5"/></svg><span className="text-sm font-semibold">Polygon</span></button>
+                      <button onClick={() => startDraw('LINE')} className="flex flex-col items-center gap-2 py-5 bg-cyan-500/10 border border-cyan-500/30 rounded-2xl text-cyan-500 hover:bg-cyan-500/20 active:scale-95 transition-all"><svg width="36" height="36" viewBox="0 0 32 32"><path d="M4 26 L14 10 L24 18 L30 6" fill="none" stroke="#06b6d4" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"/><path d="M4 26 L14 10 L24 18 L30 6" fill="none" stroke="#06b6d4" strokeWidth="8" strokeLinecap="round" strokeLinejoin="round" opacity="0.18"/></svg><span className="text-sm font-semibold">Line</span></button>
+                    </div>
+                  </div>
+                )}
+                {(draw.phase === 'circle-center' || draw.phase === 'circle-radius' || draw.phase === 'polygon' || draw.phase === 'line') && (
+                  <div className="shrink-0 px-6 py-4 border-b border-slate-200/70 dark:border-slate-700/50 space-y-3">
+                    <div className="flex items-center gap-3 px-4 py-3 rounded-xl border" style={{ borderColor: `${GEO_COLOR[draw.type]}40`, background: `${GEO_COLOR[draw.type]}10` }}>
+                      <MousePointer2 className="w-5 h-5 shrink-0" style={{ color: GEO_COLOR[draw.type] }} />
+                      <p className="text-sm font-medium text-slate-700 dark:text-slate-300">
+                        {draw.phase === 'circle-center' && 'Click on the map to place the center point'}
+                        {draw.phase === 'circle-radius' && `Click to set radius${liveRadius ? ` · ${liveRadius.toLocaleString()}m` : ''}`}
+                        {draw.phase === 'polygon' && `${draw.polygonPts.length} point${draw.polygonPts.length !== 1 ? 's' : ''} placed${draw.polygonPts.length >= 3 ? ' · Ready to finish' : ' · Need 3+ points'}`}
+                        {draw.phase === 'line' && `${draw.polygonPts.length} waypoint${draw.polygonPts.length !== 1 ? 's' : ''} placed${draw.polygonPts.length >= 2 ? ' · Ready to finish' : ' · Need 2+ points'}`}
+                      </p>
+                    </div>
+                    <div className="flex gap-2">
+                      {(draw.phase === 'polygon' || draw.phase === 'line') && <button onClick={undoLastPolygonPt} disabled={draw.polygonPts.length === 0} className="flex items-center gap-1.5 px-4 py-2 text-sm text-slate-600 dark:text-slate-300 border border-slate-300 dark:border-slate-600 rounded-xl hover:bg-slate-100 dark:hover:bg-slate-700 disabled:opacity-40 transition-colors"><Undo2 className="w-4 h-4" /> Undo</button>}
+                      {draw.phase === 'polygon' && <button onClick={finishPolygon} disabled={draw.polygonPts.length < 3} className="flex-1 flex items-center justify-center gap-2 py-2 text-sm font-semibold border rounded-xl transition-colors disabled:opacity-40 bg-purple-500/15 border-purple-500/30 text-purple-600 dark:text-purple-400 hover:bg-purple-500/25"><Check className="w-4 h-4" /> Finish Polygon</button>}
+                      {draw.phase === 'line' && <button onClick={finishLine} disabled={draw.polygonPts.length < 2} className="flex-1 flex items-center justify-center gap-2 py-2 text-sm font-semibold border rounded-xl transition-colors disabled:opacity-40 bg-cyan-500/15 border-cyan-500/30 text-cyan-600 dark:text-cyan-400 hover:bg-cyan-500/25"><Check className="w-4 h-4" /> Finish Line</button>}
+                    </div>
+                  </div>
+                )}
+                {draw.phase === 'confirm' && (
+                  <div className="shrink-0 px-6 py-5 border-b border-slate-200/70 dark:border-slate-700/50 space-y-4">
+                    <div className="flex items-center gap-3 px-4 py-3 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700/50">
+                      <div className="w-3 h-3 rounded-full shrink-0" style={{ background: GEO_COLOR[draw.type] }} />
+                      <p className="flex-1 text-sm text-slate-600 dark:text-slate-300 truncate">{draw.type === 'CIRCLE' ? `Circle · r=${draw.circleRadius}m` : draw.type === 'LINE' ? `Line · ${draw.polygonPts.length} waypoints` : `Polygon · ${draw.polygonPts.length} points`}</p>
+                      <button onClick={() => setDraw((d) => ({ ...d, phase: d.type === 'CIRCLE' ? 'circle-center' : d.type === 'POLYGON' ? 'polygon' : 'line', circleCenter: null, circleRadius: null, polygonPts: [], mousePos: null }))} className="text-sm text-slate-400 hover:text-slate-700 dark:hover:text-slate-300 flex items-center gap-1 transition-colors"><Undo2 className="w-3.5 h-3.5" /> Redraw</button>
+                    </div>
+                    <input autoFocus value={draw.name} onChange={(e) => setDraw((d) => ({ ...d, name: e.target.value }))} onKeyDown={(e) => { if (e.key === 'Enter' && draw.name.trim()) saveGeofence(); if (e.key === 'Escape') cancelDraw(); }} placeholder="Geofence name…" className="w-full bg-slate-50 dark:bg-slate-800 border border-slate-300 dark:border-slate-600 rounded-xl px-4 py-3 text-sm text-slate-800 dark:text-slate-200 focus:outline-none focus:border-blue-500 placeholder-slate-400" />
+                    {(draw.type === 'LINE' || draw.type === 'CIRCLE') && (
+                      <div className="flex items-center gap-4 bg-slate-50 dark:bg-slate-800/60 rounded-xl px-4 py-3 border border-slate-200 dark:border-slate-700/50">
+                        <div className="flex-1"><p className="text-sm font-semibold text-slate-700 dark:text-slate-300">Buffer Zone</p><p className="text-xs text-slate-400">{draw.type === 'LINE' ? 'Corridor width on each side' : 'Extra zone outside radius'}</p></div>
+                        <div className="flex items-center gap-2"><input type="number" min="0" step="10" value={draw.bufferMeters || ''} onChange={(e) => setDraw((d) => ({ ...d, bufferMeters: Number(e.target.value) || 0 }))} placeholder="0" className="w-20 bg-white dark:bg-slate-700 border border-slate-300 dark:border-slate-600 rounded-lg px-3 py-1.5 text-sm text-right focus:outline-none focus:border-blue-500" /><span className="text-sm text-slate-500">m</span></div>
+                      </div>
+                    )}
+                    <div className="flex gap-3">
+                      <button onClick={cancelDraw} className="px-5 py-2.5 rounded-xl text-sm text-slate-500 dark:text-slate-400 bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors">Cancel</button>
+                      <button onClick={saveGeofence} disabled={geoSaving || !draw.name.trim()} className={`flex-1 flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-semibold border transition-colors disabled:opacity-50 ${draw.type === 'CIRCLE' ? 'bg-amber-500/15 border-amber-500/30 text-amber-600 dark:text-amber-400 hover:bg-amber-500/25' : draw.type === 'POLYGON' ? 'bg-purple-500/15 border-purple-500/30 text-purple-600 dark:text-purple-400 hover:bg-purple-500/25' : 'bg-cyan-500/15 border-cyan-500/30 text-cyan-600 dark:text-cyan-400 hover:bg-cyan-500/25'}`}>{geoSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}{draw.editId != null ? 'Update Geofence' : 'Save Geofence'}</button>
+                    </div>
+                  </div>
+                )}
+                <div className="flex-1 overflow-y-auto min-h-0">
+                  {geoLoading && <div className="flex items-center justify-center py-16"><Loader2 className="w-7 h-7 animate-spin text-amber-500" /></div>}
+                  {!geoLoading && geofences.length === 0 && draw.phase === 'idle' && <div className="flex flex-col items-center justify-center py-16 text-slate-400"><Shield className="w-10 h-10 mb-3 opacity-20" /><p className="text-sm">No geofences yet</p><p className="text-xs mt-1 text-center">Click "Add Geofence" to draw one on the map</p></div>}
+                  <div className="divide-y divide-slate-100 dark:divide-slate-700/30">
+                    {geofences.map((g) => (
+                      <div key={g.id} className="flex items-center gap-3 px-6 py-4 hover:bg-slate-50 dark:hover:bg-slate-800/40 transition-colors cursor-pointer"
+                        onClick={() => { const center = geofenceCenter(g); if (center) { setCenterTarget(center); setPinnedMarker({ lat: center[0], lng: center[1], title: g.name, detail: `${g.type}${g.radiusMeters ? ` · ${g.radiusMeters}m radius` : ''}${g.bufferMeters ? ` · buffer ${g.bufferMeters}m` : ''}`, color: GEO_COLOR[g.type] }); setActivePanel(null); } }}>
+                        <div className="shrink-0 w-10 h-10 rounded-full flex items-center justify-center" style={{ background: `${GEO_COLOR[g.type]}20`, border: `2px solid ${GEO_COLOR[g.type]}60` }}><div className="w-3.5 h-3.5 rounded-full" style={{ background: GEO_COLOR[g.type] }} /></div>
+                        <div className="flex-1 min-w-0"><p className="text-sm font-semibold text-slate-800 dark:text-slate-200 truncate">{g.name}</p><p className="text-xs text-slate-400 dark:text-slate-500">{g.type}{g.type === 'CIRCLE' && g.radiusMeters ? ` · ${g.radiusMeters}m radius` : ''}{g.bufferMeters ? ` · buffer ${g.bufferMeters}m` : ''}</p></div>
+                        <span className={`text-xs px-2.5 py-1 rounded-full font-semibold shrink-0 ${g.active ? 'bg-green-500/15 text-green-600 dark:text-green-400' : 'bg-slate-100 dark:bg-slate-700 text-slate-500'}`}>{g.active ? 'Active' : 'Inactive'}</span>
+                        <button onClick={(e) => { e.stopPropagation(); startDraw(g.type, g); }} className="p-2.5 text-slate-400 hover:text-blue-500 hover:bg-blue-50 dark:hover:bg-slate-700/50 rounded-xl transition-colors"><Pencil className="w-4 h-4" /></button>
+                        <button onClick={(e) => { e.stopPropagation(); deleteGeofence(g.id); }} disabled={geoDeleting === g.id} className="p-2.5 text-slate-400 hover:text-red-500 hover:bg-red-50 dark:hover:bg-slate-700/50 rounded-xl transition-colors disabled:opacity-40">{geoDeleting === g.id ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}</button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                {geoTotalPages > 1 && (
+                  <div className="shrink-0 flex items-center justify-between px-6 py-3 border-t border-slate-200/70 dark:border-slate-700/50">
+                    <button onClick={() => fetchGeofences(geoPage - 1)} disabled={geoPage === 0 || geoLoading} className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold text-slate-600 dark:text-slate-300 bg-slate-100 dark:bg-slate-800 disabled:opacity-40 transition-colors"><ChevronLeft className="w-4 h-4" /> Prev</button>
+                    <span className="text-sm text-slate-500">{geoPage + 1} / {geoTotalPages}</span>
+                    <button onClick={() => fetchGeofences(geoPage + 1)} disabled={geoPage >= geoTotalPages - 1 || geoLoading} className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold text-slate-600 dark:text-slate-300 bg-slate-100 dark:bg-slate-800 disabled:opacity-40 transition-colors">Next <ChevronRight className="w-4 h-4" /></button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Events panel */}
+            {activePanel === 'events' && (
+              <div className="flex flex-col flex-1 overflow-hidden min-h-0">
+                <div className="shrink-0 flex items-center justify-between px-6 py-3 border-b border-slate-200/70 dark:border-slate-700/50 bg-slate-50 dark:bg-slate-800/40">
+                  <p className="text-sm text-slate-500 dark:text-slate-400">ENTER / EXIT boundary events</p>
+                  <button onClick={() => fetchGeoEvents(0)} disabled={geoEventsLoading} className="p-2 rounded-lg text-slate-500 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors">{geoEventsLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}</button>
+                </div>
+                <div className="flex-1 overflow-y-auto min-h-0">
+                  {geoEventsLoading && <div className="flex items-center justify-center py-16"><Loader2 className="w-7 h-7 animate-spin text-blue-500" /></div>}
+                  {!geoEventsLoading && geoEvents.length === 0 && <div className="flex flex-col items-center justify-center py-16 text-slate-400"><Activity className="w-10 h-10 mb-3 opacity-20" /><p className="text-sm">No events yet</p><p className="text-xs mt-1">ENTER / EXIT events appear here as they occur</p></div>}
+                  <div className="divide-y divide-slate-100 dark:divide-slate-700/30">
+                    {geoEvents.map((ev) => (
+                      <div key={ev.id} className="flex items-start gap-4 px-6 py-4 hover:bg-slate-50 dark:hover:bg-slate-800/40 transition-colors cursor-pointer"
+                        onClick={() => { setCenterTarget([ev.latitude, ev.longitude]); setPinnedMarker({ lat: ev.latitude, lng: ev.longitude, title: `${ev.eventType}: ${ev.geofenceName}`, detail: new Date(ev.eventTime).toLocaleString(), color: ev.eventType === 'ENTER' ? '#22c55e' : '#ef4444' }); setActivePanel(null); }}>
+                        <span className={`mt-0.5 shrink-0 text-xs font-bold px-2.5 py-1 rounded-lg ${ev.eventType === 'ENTER' ? 'bg-green-500/15 text-green-600 dark:text-green-400' : 'bg-red-500/15 text-red-600 dark:text-red-400'}`}>{ev.eventType}</span>
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-semibold text-slate-800 dark:text-slate-200 truncate">{ev.geofenceName}</p>
+                          <p className="text-xs font-mono text-slate-400 dark:text-slate-500 mt-0.5">{ev.latitude.toFixed(6)}, {ev.longitude.toFixed(6)}</p>
+                          <p className="text-xs text-slate-400 mt-1">{new Date(ev.eventTime).toLocaleString()}</p>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                {geoEventsTotalPages > 1 && (
+                  <div className="shrink-0 flex items-center justify-between px-6 py-3 border-t border-slate-200/70 dark:border-slate-700/50">
+                    <button onClick={() => fetchGeoEvents(geoEventsPage - 1)} disabled={geoEventsPage === 0 || geoEventsLoading} className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold text-slate-600 dark:text-slate-300 bg-slate-100 dark:bg-slate-800 disabled:opacity-40 transition-colors"><ChevronLeft className="w-4 h-4" /> Prev</button>
+                    <span className="text-sm text-slate-500">{geoEventsPage + 1} / {geoEventsTotalPages}</span>
+                    <button onClick={() => fetchGeoEvents(geoEventsPage + 1)} disabled={geoEventsPage >= geoEventsTotalPages - 1 || geoEventsLoading} className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-sm font-semibold text-slate-600 dark:text-slate-300 bg-slate-100 dark:bg-slate-800 disabled:opacity-40 transition-colors">Next <ChevronRight className="w-4 h-4" /></button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Trips panel */}
+            {activePanel === 'trips' && (
+              <div className="flex flex-col flex-1 overflow-hidden min-h-0">
+                <div className="shrink-0 flex items-center justify-between px-6 py-3 border-b border-slate-200/70 dark:border-slate-700/50 bg-slate-50 dark:bg-slate-800/40">
+                  <p className="text-sm text-slate-500 dark:text-slate-400">Detected journeys in the selected range</p>
+                  <button onClick={() => fetchTrips(0)} disabled={tripsLoading} className="p-2 rounded-lg text-slate-500 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors">{tripsLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}</button>
+                </div>
+                <div className="flex-1 overflow-y-auto min-h-0">
+                  {tripsLoading && <div className="flex items-center justify-center py-16"><Loader2 className="w-7 h-7 animate-spin text-indigo-500" /></div>}
+                  {!tripsLoading && trips.length === 0 && <div className="flex flex-col items-center justify-center py-16 text-slate-400"><Route className="w-10 h-10 mb-3 opacity-20" /><p className="text-sm">No trips found</p><p className="text-xs mt-1">Search history first to populate trips</p></div>}
+                  <div className="divide-y divide-slate-100 dark:divide-slate-700/30">
+                    {trips.map((trip) => (
+                      <div key={trip.id} className={`flex items-center gap-4 px-6 py-4 cursor-pointer transition-colors hover:bg-indigo-50 dark:hover:bg-indigo-900/20 ${selectedTrip?.id === trip.id ? 'bg-indigo-50 dark:bg-indigo-900/20' : ''}`}
+                        onClick={() => { setSelectedTrip(selectedTrip?.id === trip.id ? null : trip); if (trip.startLat && trip.startLng) { setCenterTarget([trip.startLat, trip.startLng]); setPinnedMarker({ lat: trip.startLat, lng: trip.startLng, title: `Trip — ${new Date(trip.startTime).toLocaleTimeString()} → ${trip.endTime ? new Date(trip.endTime).toLocaleTimeString() : '…'}`, detail: `${trip.totalDistanceMeters >= 1000 ? (trip.totalDistanceMeters/1000).toFixed(2)+' km' : Math.round(trip.totalDistanceMeters)+' m'} · avg ${trip.avgSpeedKmh.toFixed(1)} km/h · max ${trip.maxSpeedKmh.toFixed(0)} km/h`, color: '#6366f1' }); } setActivePanel(null); }}>
+                        <div className={`w-3 h-3 rounded-full shrink-0 ${trip.status === 'ACTIVE' ? 'bg-green-400 animate-pulse' : 'bg-slate-300 dark:bg-slate-600'}`} />
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-semibold text-slate-800 dark:text-slate-200">{new Date(trip.startTime).toLocaleTimeString()} → {trip.endTime ? new Date(trip.endTime).toLocaleTimeString() : '…'}</p>
+                          <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">{trip.totalDistanceMeters >= 1000 ? `${(trip.totalDistanceMeters/1000).toFixed(2)} km` : `${Math.round(trip.totalDistanceMeters)} m`}{' '}· avg {trip.avgSpeedKmh.toFixed(1)} km/h · max {trip.maxSpeedKmh.toFixed(0)} km/h</p>
+                          <p className="text-xs text-slate-400 mt-0.5">{new Date(trip.startTime).toLocaleDateString()}</p>
+                        </div>
+                        <span className={`text-xs font-bold px-2.5 py-1 rounded-lg shrink-0 ${trip.status === 'ACTIVE' ? 'bg-green-500/15 text-green-600 dark:text-green-400' : 'bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400'}`}>{trip.status}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Alerts panel */}
+            {activePanel === 'alerts' && (
+              <div className="flex flex-col flex-1 overflow-hidden min-h-0">
+                <div className="shrink-0 flex items-center justify-between px-6 py-3 border-b border-slate-200/70 dark:border-slate-700/50 bg-slate-50 dark:bg-slate-800/40">
+                  <p className="text-sm text-slate-500 dark:text-slate-400">Speed, braking, and safety events</p>
+                  <button onClick={fetchTrackEvents} disabled={trackEventsLoading} className="p-2 rounded-lg text-slate-500 hover:bg-slate-200 dark:hover:bg-slate-700 transition-colors">{trackEventsLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}</button>
+                </div>
+                <div className="flex-1 overflow-y-auto min-h-0">
+                  {trackEventsLoading && <div className="flex items-center justify-center py-16"><Loader2 className="w-7 h-7 animate-spin text-orange-500" /></div>}
+                  {!trackEventsLoading && trackEvents.length === 0 && <div className="flex flex-col items-center justify-center py-16 text-slate-400"><AlertTriangle className="w-10 h-10 mb-3 opacity-20" /><p className="text-sm">No alerts detected</p><p className="text-xs mt-1">Overspeeding, braking, and other events appear here</p></div>}
+                  <div className="divide-y divide-slate-100 dark:divide-slate-700/30">
+                    {trackEvents.map((ev) => {
+                      const colorMap = { OVERSPEEDING: 'bg-red-500/15 text-red-600 dark:text-red-400', HARSH_BRAKING: 'bg-orange-500/15 text-orange-600 dark:text-orange-400', SHARP_TURN: 'bg-yellow-500/15 text-yellow-600 dark:text-yellow-400', DEVICE_OFFLINE: 'bg-slate-500/15 text-slate-600 dark:text-slate-400', BATTERY_LOW: 'bg-amber-500/15 text-amber-600 dark:text-amber-400', GPS_LOST: 'bg-purple-500/15 text-purple-600 dark:text-purple-400' };
+                      const pinColorMap = { OVERSPEEDING: '#ef4444', HARSH_BRAKING: '#f97316', SHARP_TURN: '#eab308', DEVICE_OFFLINE: '#64748b', BATTERY_LOW: '#f59e0b', GPS_LOST: '#a855f7' };
+                      return (
+                        <div key={ev.id} className="flex items-start gap-4 px-6 py-4 hover:bg-slate-50 dark:hover:bg-slate-800/40 transition-colors cursor-pointer"
+                          onClick={() => { setCenterTarget([ev.latitude, ev.longitude]); setPinnedMarker({ lat: ev.latitude, lng: ev.longitude, title: ev.eventType.replace(/_/g, ' '), detail: `${ev.speed != null ? ev.speed.toFixed(1)+' km/h · ' : ''}${new Date(ev.eventTime).toLocaleString()}`, color: pinColorMap[ev.eventType] ?? '#f97316' }); setActivePanel(null); }}>
+                          <span className={`mt-0.5 shrink-0 text-xs font-bold px-2.5 py-1 rounded-lg whitespace-nowrap ${colorMap[ev.eventType] ?? 'bg-slate-100 text-slate-600'}`}>{ev.eventType.replace(/_/g, ' ')}</span>
+                          <div className="flex-1 min-w-0">
+                            {ev.speed != null && <p className="text-sm font-semibold text-slate-700 dark:text-slate-300">{ev.speed.toFixed(1)} km/h</p>}
+                            <p className="text-xs font-mono text-slate-400 dark:text-slate-500">{ev.latitude.toFixed(6)}, {ev.longitude.toFixed(6)}</p>
+                            <p className="text-xs text-slate-400 mt-1">{new Date(ev.eventTime).toLocaleString()}</p>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Mobile in-overlay bottom nav */}
+            <div className="md:hidden shrink-0 flex items-stretch border-t border-gray-200/80 dark:border-slate-700/60 bg-white dark:bg-slate-950">
+              {[
+                { id: null,        Icon: MapPin,        label: 'Map'     },
+                { id: 'history',   Icon: Sheet,         label: 'History' },
+                { id: 'geofences', Icon: Shield,        label: 'Fences'  },
+                { id: 'events',    Icon: Activity,      label: 'Events'  },
+                { id: 'trips',     Icon: Route,         label: 'Trips'   },
+                { id: 'alerts',    Icon: AlertTriangle, label: 'Alerts'  },
+              ].map(({ id, Icon, label }) => {
+                const isActive = activePanel === id;
+                return (
+                  <button key={label} onClick={() => setActivePanel(id)} className={`flex flex-1 flex-col items-center justify-center gap-0.5 py-2.5 relative min-w-0 transition-colors ${isActive ? 'text-blue-600 dark:text-blue-400' : 'text-gray-400 dark:text-slate-500'}`}>
+                    {isActive && <span className="absolute top-0 inset-x-0 h-0.5 rounded-full bg-blue-600 dark:bg-blue-400" />}
+                    <Icon className={`w-4 h-4 transition-transform duration-150 ${isActive ? 'scale-110' : ''}`} />
+                    <span className={`text-[9px] font-semibold truncate w-full text-center px-0.5 ${isActive ? 'text-blue-600 dark:text-blue-400' : ''}`}>{label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Tracking config modal */}
+      {configModal && (
+        <div className="fixed inset-0 z-[2000] overflow-y-auto bg-[radial-gradient(circle_at_top,rgba(59,130,246,0.18),transparent_32%),radial-gradient(circle_at_bottom,rgba(16,185,129,0.14),transparent_34%),rgba(2,6,23,0.76)] px-0 py-0 backdrop-blur-xl md:px-6 md:py-8 animate-in fade-in-0 duration-200" onClick={() => { if (!configEditing && !configSaving) closeConfigModal(); }}>
+          <div className="flex min-h-full items-end justify-center md:items-center">
+            <div role="dialog" aria-modal="true" onClick={(e) => e.stopPropagation()} className="relative flex h-[100svh] w-full flex-col overflow-hidden border border-white/20 bg-white/95 shadow-[0_30px_120px_rgba(2,6,23,0.48)] backdrop-blur-2xl dark:border-slate-700/70 dark:bg-slate-950/95 md:h-auto md:max-h-[92vh] md:max-w-5xl md:rounded-[32px] animate-in slide-in-from-bottom-10 md:zoom-in-95 duration-300">
+              <div className="relative shrink-0 border-b border-slate-200/70 bg-white/80 backdrop-blur-xl dark:border-slate-800/80 dark:bg-slate-950/75">
+                <div className="flex flex-col gap-4 px-5 py-5 md:px-6">
+                  <div className="flex items-start gap-4">
+                    <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-[20px] bg-[linear-gradient(135deg,#0f172a_0%,#2563eb_52%,#22d3ee_100%)] shadow-[0_18px_48px_rgba(37,99,235,0.35)]"><Settings className="h-6 w-6 text-white" /></div>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="rounded-full border border-slate-200/80 bg-white/80 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-600 shadow-sm dark:border-slate-700/80 dark:bg-slate-900/70 dark:text-slate-300">Tracking Control Center</span>
+                        <span className={`rounded-full border px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.2em] ${configEditing ? 'border-amber-200/80 bg-amber-500/10 text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/15 dark:text-amber-200' : 'border-emerald-200/80 bg-emerald-500/10 text-emerald-700 dark:border-emerald-500/30 dark:bg-emerald-500/15 dark:text-emerald-200'}`}>{configEditing ? 'Edit mode' : 'Live view'}</span>
+                        <span className="rounded-full border border-slate-200/80 bg-slate-100/70 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.2em] text-slate-500 dark:border-slate-700/70 dark:bg-slate-900/60 dark:text-slate-400">{TRACKING_CONFIG_FIELD_COUNT} parameters</span>
+                      </div>
+                      <h2 className="mt-3 text-2xl font-semibold tracking-tight text-slate-950 dark:text-white md:text-[2rem]">Tracking Configuration</h2>
+                      <p className="mt-2 text-sm leading-6 text-slate-600 dark:text-slate-300"><span className="font-semibold text-slate-900 dark:text-slate-100">{deviceUuid ?? 'Unknown device'}</span></p>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-2">
+                      {!configEditing && <button onClick={startConfigEditing} className="hidden sm:inline-flex items-center gap-2 rounded-2xl border border-blue-500/20 bg-blue-500/10 px-4 py-2.5 text-sm font-semibold text-blue-700 shadow-sm transition-all hover:-translate-y-0.5 hover:bg-blue-500/15 dark:border-blue-500/30 dark:bg-blue-500/15 dark:text-blue-100"><SlidersHorizontal className="h-4 w-4" />Edit Configuration</button>}
+                      <button onClick={closeConfigModal} disabled={configSaving} className="inline-flex h-11 w-11 items-center justify-center rounded-2xl border border-slate-200/80 bg-white/90 text-slate-500 shadow-sm transition-all hover:-translate-y-0.5 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700/80 dark:bg-slate-900/80 dark:text-slate-300 dark:hover:bg-slate-800"><X className="h-4 w-4" /></button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div className="relative flex-1 overflow-y-auto min-h-0">
+                {configLoading ? (
+                  <div className="flex min-h-[420px] flex-col items-center justify-center gap-4 px-6 text-center">
+                    <div className="relative flex h-20 w-20 items-center justify-center rounded-full border border-white/30 bg-white/70 shadow-[0_20px_50px_rgba(37,99,235,0.16)] backdrop-blur-xl dark:border-slate-700/60 dark:bg-slate-900/70"><Loader2 className="relative h-8 w-8 animate-spin text-blue-500" /></div>
+                    <p className="text-base font-semibold text-slate-900 dark:text-slate-100">Loading live configuration</p>
+                  </div>
+                ) : configData ? (
+                  <div className="space-y-6 px-5 pb-6 pt-5 md:px-6 md:pb-7">
+                    <section className="relative overflow-hidden rounded-[30px] bg-[linear-gradient(135deg,#0f172a_0%,#1d4ed8_48%,#0891b2_100%)] p-5 text-white shadow-[0_28px_90px_rgba(15,23,42,0.36)] md:p-6">
+                      <div className="relative space-y-5">
+                        <h3 className="text-2xl font-semibold tracking-tight text-white md:text-3xl">Current tracking profile</h3>
+                        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                          {configHeroStats.map(({ label, value, unit, detail, Icon: HeroIcon, accentClassName }) => (
+                            <div key={label} className={`rounded-[24px] border border-white/10 bg-gradient-to-br ${accentClassName} px-4 py-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.12)] backdrop-blur-sm`}>
+                              <div className="flex items-start justify-between gap-3">
+                                <div className="min-w-0">
+                                  <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-white/65">{label}</p>
+                                  <p className={`mt-2 font-semibold tracking-tight text-white ${String(value).length > 18 ? 'text-base break-all md:text-lg' : 'text-2xl'}`}>{value}{unit && <span className="ml-1.5 text-sm font-medium text-white/65">{unit}</span>}</p>
+                                  <p className="mt-1 text-xs leading-5 text-white/70">{detail}</p>
+                                </div>
+                                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-white/10 text-white/80"><HeroIcon className="h-4 w-4" /></div>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    </section>
+                    {configEditing ? (
+                      <div className="space-y-5">
+                        {TRACKING_CONFIG_SECTIONS.map((section) => {
+                          const SectionIcon = section.icon;
+                          return (
+                            <section key={section.id} className={`rounded-[24px] border p-5 ${section.surfaceClassName}`}>
+                              <div className="flex items-center gap-3 mb-4">
+                                <div className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-[12px] ${section.iconClassName}`}><SectionIcon className="h-4 w-4" /></div>
+                                <div>
+                                  <p className="text-[10px] font-semibold uppercase tracking-[0.22em] text-slate-500 dark:text-slate-400">{section.eyebrow}</p>
+                                  <h4 className="text-sm font-semibold text-slate-900 dark:text-slate-100">{section.title}</h4>
+                                </div>
+                              </div>
+                              <div className="grid gap-3 sm:grid-cols-2">
+                                {section.fields.map((field) => {
+                                  const isTextField = field.inputType === 'text';
+                                  const fieldValue = configForm[field.key];
+                                  const spanClass = isTextField ? 'sm:col-span-2' : (field.cardSpanClassName ?? '');
+                                  return (
+                                    <div key={field.key} className={`rounded-[14px] border border-slate-200 bg-white dark:border-slate-700 dark:bg-slate-900 ${spanClass}`}>
+                                      <div className="px-3 pt-3 pb-2">
+                                        <div className="flex items-center justify-between gap-2 mb-2">
+                                          <label className="text-[11px] font-bold uppercase tracking-[0.15em] text-slate-600 dark:text-slate-300">
+                                            {field.label}
+                                          </label>
+                                          {field.unit && !isTextField && (
+                                            <span className="shrink-0 text-[10px] font-semibold text-slate-400 dark:text-slate-500">{field.unit}</span>
+                                          )}
+                                        </div>
+                                        {isTextField ? (
+                                          <input
+                                            type="text"
+                                            placeholder={field.placeholder ?? 'Enter value…'}
+                                            value={fieldValue ?? ''}
+                                            onChange={(e) => setConfigForm((c) => ({ ...c, [field.key]: e.target.value }))}
+                                            style={{ color: 'inherit' }}
+                                            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/15 dark:border-slate-600 dark:bg-slate-800 dark:text-white dark:placeholder:text-slate-500 dark:focus:border-emerald-400"
+                                          />
+                                        ) : (
+                                          <input
+                                            type="number"
+                                            min={field.min ?? 0}
+                                            step={field.step ?? 1}
+                                            placeholder="Not set"
+                                            value={fieldValue ?? ''}
+                                            onChange={(e) => setConfigForm((c) => ({ ...c, [field.key]: e.target.value === '' ? undefined : Number(e.target.value) }))}
+                                            style={{ color: 'inherit' }}
+                                            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-sm font-semibold text-slate-900 outline-none transition-colors placeholder:text-slate-400 focus:border-sky-500 focus:ring-2 focus:ring-sky-500/15 dark:border-slate-600 dark:bg-slate-800 dark:text-white dark:placeholder:text-slate-500 dark:focus:border-sky-400"
+                                          />
+                                        )}
+                                      </div>
+                                      {field.description && (
+                                        <p className="border-t border-slate-100 px-3 py-2 text-[11px] leading-4 text-slate-400 dark:border-slate-800 dark:text-slate-500">{field.description}</p>
+                                      )}
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </section>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <div className="space-y-5">
+                        {TRACKING_CONFIG_SECTIONS.map((section) => {
+                          const SectionIcon = section.icon;
+                          return (
+                            <section key={section.id} className={`relative overflow-hidden rounded-[28px] border p-5 ${section.surfaceClassName}`}>
+                              <div className="flex items-start gap-3 mb-5">
+                                <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-[14px] ${section.iconClassName}`}><SectionIcon className="h-4.5 w-4.5" /></div>
+                                <div>
+                                  <p className="text-[11px] font-semibold uppercase tracking-[0.22em] text-slate-500 dark:text-slate-400">{section.eyebrow}</p>
+                                  <h4 className="mt-0.5 text-base font-semibold text-slate-900 dark:text-slate-100">{section.title}</h4>
+                                </div>
+                              </div>
+                              <div className={`grid gap-3 ${section.gridClassName}`}>
+                                {section.fields.map((field) => {
+                                  const value = getTrackingConfigValue(configData, field.key);
+                                  const isEmpty = value === undefined || value === null || value === '';
+                                  const isTextField = field.inputType === 'text';
+                                  return (
+                                    <div key={field.key} className={`group rounded-[18px] border border-slate-200 bg-white p-4 shadow-sm transition-transform duration-200 hover:-translate-y-0.5 dark:border-slate-700 dark:bg-slate-900 ${field.cardSpanClassName ?? ''}`}>
+                                      <div className="flex items-start justify-between gap-2">
+                                        <p className="text-[11px] font-bold uppercase tracking-[0.18em] text-slate-500 dark:text-slate-400">{field.label}</p>
+                                        {field.unit && !isTextField && (
+                                          <span className="shrink-0 rounded-lg bg-slate-100 px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.14em] text-slate-500 dark:bg-slate-800 dark:text-slate-400">{field.unit}</span>
+                                        )}
+                                      </div>
+                                      {isTextField ? (
+                                        <div className="mt-3 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2.5 dark:border-slate-700 dark:bg-slate-800">
+                                          <p className={`text-sm break-all ${isEmpty ? 'italic text-slate-400 dark:text-slate-500' : 'font-mono font-medium text-slate-900 dark:text-white'}`}>
+                                            {isEmpty ? 'Default endpoint' : String(value)}
+                                          </p>
+                                        </div>
+                                      ) : (
+                                        <div className="mt-3 flex items-end gap-1.5">
+                                          <span className={`text-3xl font-bold tabular-nums tracking-tight ${isEmpty ? 'text-slate-300 dark:text-slate-600' : 'text-slate-900 dark:text-white'}`}>
+                                            {isEmpty ? '—' : value}
+                                          </span>
+                                          {field.unit && !isEmpty && (
+                                            <span className="mb-1 text-sm font-semibold text-slate-400 dark:text-slate-500">{field.unit}</span>
+                                          )}
+                                        </div>
+                                      )}
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </section>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="flex min-h-[420px] flex-col items-center justify-center px-6 py-16 text-center">
+                    <div className="flex h-20 w-20 items-center justify-center rounded-[28px] border border-slate-200/80 bg-white/90 shadow-[0_20px_50px_rgba(15,23,42,0.08)] dark:border-slate-800/80 dark:bg-slate-900/80"><Settings className="h-9 w-9 text-slate-300 dark:text-slate-600" /></div>
+                    <h3 className="mt-5 text-xl font-semibold text-slate-950 dark:text-slate-100">Configuration unavailable</h3>
+                    <p className="mt-2 max-w-md text-sm leading-6 text-slate-500 dark:text-slate-400">We could not find a tracking configuration for this device yet.</p>
+                  </div>
+                )}
+              </div>
+              <div className="relative shrink-0 border-t border-slate-200/70 bg-white/85 px-5 py-4 backdrop-blur-xl dark:border-slate-800/80 dark:bg-slate-950/80 md:px-6">
+                {configEditing ? (
+                  <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                    <p className="max-w-2xl text-sm leading-6 text-slate-500 dark:text-slate-400">Saving this draft writes the new values to the platform and immediately pushes them to the device.</p>
+                    <div className="flex flex-col gap-3 sm:flex-row">
+                      <button onClick={cancelConfigEditing} disabled={configSaving} className="inline-flex items-center justify-center rounded-2xl border border-slate-200 bg-slate-100 px-5 py-3 text-sm font-semibold text-slate-600 transition-all hover:-translate-y-0.5 hover:bg-slate-200 disabled:cursor-not-allowed disabled:opacity-60 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700">Discard Draft</button>
+                      <button onClick={saveConfig} disabled={configSaving} className="inline-flex items-center justify-center gap-2 rounded-2xl bg-[linear-gradient(135deg,#0f172a_0%,#2563eb_54%,#22d3ee_100%)] px-5 py-3 text-sm font-semibold text-white shadow-[0_18px_45px_rgba(37,99,235,0.28)] transition-all hover:-translate-y-0.5 hover:shadow-[0_22px_55px_rgba(37,99,235,0.36)] disabled:cursor-not-allowed disabled:opacity-60">{configSaving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}Save &amp; Push to Device</button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                    <p className="max-w-2xl text-sm leading-6 text-slate-500 dark:text-slate-400">Live values are grouped here for quick review. Open edit mode when you want to send a polished update to the device.</p>
+                    <div className="flex flex-col gap-3 sm:flex-row">
+                      <button onClick={closeConfigModal} className="inline-flex items-center justify-center rounded-2xl border border-slate-200 bg-slate-100 px-5 py-3 text-sm font-semibold text-slate-600 transition-all hover:-translate-y-0.5 hover:bg-slate-200 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300 dark:hover:bg-slate-700">Close</button>
+                      <button onClick={startConfigEditing} className="inline-flex items-center justify-center gap-2 rounded-2xl bg-[linear-gradient(135deg,#0f172a_0%,#2563eb_54%,#22d3ee_100%)] px-5 py-3 text-sm font-semibold text-white shadow-[0_18px_45px_rgba(37,99,235,0.28)] transition-all hover:-translate-y-0.5 hover:shadow-[0_22px_55px_rgba(37,99,235,0.36)]"><SlidersHorizontal className="h-4 w-4" />Edit Configuration</button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bulk upload modal */}
+      {uploadModal && (
+        <div className="fixed inset-0 z-[2000] flex items-center justify-center bg-black/60 px-4">
+          <div className="bg-white dark:bg-slate-900 border border-gray-200 dark:border-slate-700/60 rounded-2xl w-full max-w-lg shadow-2xl">
+            <div className="flex items-center justify-between px-5 py-4 border-b border-gray-200 dark:border-slate-700/50">
+              <p className="text-sm font-semibold text-gray-900 dark:text-slate-100">Bulk Upload GPS Data</p>
+              <button onClick={() => setUploadModal(false)} className="p-1.5 text-gray-500 dark:text-slate-400 hover:text-gray-800 rounded-lg hover:bg-gray-100 dark:hover:bg-slate-700/50 transition-colors"><X className="w-4 h-4" /></button>
+            </div>
+            <div className="p-5 space-y-3">
+              <p className="text-xs text-gray-500 dark:text-slate-400">Paste a JSON array of tracking point objects.</p>
+              <textarea rows={10} value={uploadJson} onChange={(e) => setUploadJson(e.target.value)} placeholder={'[\n  {\n    "latitude": 33.684,\n    "longitude": 73.047,\n    "speed": 0,\n    "reason": "Distance",\n    ...\n  }\n]'} className="w-full bg-gray-100 dark:bg-slate-800 border border-gray-300 dark:border-slate-600 rounded-lg px-3 py-2 text-xs text-gray-800 dark:text-slate-200 font-mono focus:outline-none focus:border-blue-500 placeholder-gray-400 dark:placeholder-slate-500 resize-none" />
+              {uploadMsg && <div className={`text-xs px-3 py-2 rounded-lg ${uploadMsg.ok ? 'bg-green-500/10 text-green-600 dark:text-green-400 border border-green-500/20' : 'bg-red-500/10 text-red-600 dark:text-red-400 border border-red-500/20'}`}>{uploadMsg.text}</div>}
+            </div>
+            <div className="flex gap-3 px-5 pb-5">
+              <button onClick={() => setUploadModal(false)} className="flex-1 py-2.5 bg-gray-100 dark:bg-slate-700/50 rounded-xl text-sm text-gray-600 dark:text-slate-400 hover:bg-gray-200 dark:hover:bg-slate-700 transition-colors">Close</button>
+              <button onClick={handleBulkUpload} disabled={uploading || !uploadJson.trim()} className="flex-1 flex items-center justify-center gap-2 py-2.5 bg-blue-600/15 border border-blue-500/30 text-blue-600 dark:text-blue-400 rounded-xl text-sm font-semibold hover:bg-blue-600/25 transition-colors disabled:opacity-50">{uploading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />} Upload</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PointPopup({ point, color, label }) {
+  if (!point) return null;
+  const rows = [
+    ['Received At', formatDateTimeWithMillis(point.receivedAt)],
+    ['Latitude',    point.latitude?.toFixed(6) ?? '-'],
+    ['Longitude',   point.longitude?.toFixed(6) ?? '-'],
+    ['Speed',       point.speed != null ? `${point.speed.toFixed(1)} km/h` : '-'],
+    ['Accuracy',    point.accuracy != null ? `±${point.accuracy.toFixed(0)} m` : '-'],
+    ['Altitude',    point.altitude != null ? `${point.altitude.toFixed(0)} m` : '-'],
+    ['Bearing',     point.bearing != null ? `${point.bearing.toFixed(1)}°` : '-'],
+    ['Satellites',  `${point.connectedSatellite ?? '-'} / ${point.availableSatellite ?? '-'}`],
+    ['Provider',    point.provider || '-'],
+    ['IG Status',   point.igStatus === 1 ? 'ON' : 'OFF'],
+    ['Reason',      point.reason || '-'],
+  ];
+  return (
+    <div style={{ fontFamily: 'system-ui,sans-serif', minWidth: 210 }}>
+      <div style={{ background: color, borderRadius: '6px 6px 0 0', padding: '6px 10px', display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+        <span style={{ width: 8, height: 8, borderRadius: '50%', background: 'white', display: 'inline-block', flexShrink: 0 }} />
+        <span style={{ color: 'white', fontWeight: 700, fontSize: 11, letterSpacing: '0.05em' }}>{label ?? point.reason?.toUpperCase() ?? 'LOCATION'}</span>
+      </div>
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
+        <tbody>
+          {rows.map(([k, v]) => (
+            <tr key={k} style={{ borderBottom: '1px solid #e2e8f0' }}>
+              <td style={{ padding: '3px 6px', color: '#64748b', whiteSpace: 'nowrap', fontWeight: 600 }}>{k}</td>
+              <td style={{ padding: '3px 6px', color: '#1e293b', fontFamily: k==='Latitude'||k==='Longitude' ? 'monospace' : 'inherit' }}>{v}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function GeofencePopup({ geo, onEdit }) {
+  return (
+    <div style={{ fontFamily: 'system-ui,sans-serif', minWidth: 180 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+        <strong style={{ fontSize: 12, color: '#1e293b' }}>{geo.name}</strong>
+        <span style={{ fontSize: 10, background: geo.active ? '#dcfce7' : '#f1f5f9', color: geo.active ? '#16a34a' : '#64748b', padding: '1px 6px', borderRadius: 4, border: `1px solid ${geo.active ? '#bbf7d0' : '#e2e8f0'}` }}>{geo.active ? 'Active' : 'Inactive'}</span>
+      </div>
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
+        <tbody>
+          <tr><td style={{ color:'#64748b',padding:'2px 4px',fontWeight:600 }}>Type</td><td style={{ color:'#1e293b',padding:'2px 4px' }}>{geo.type}</td></tr>
+          {geo.type === 'CIRCLE' && geo.radiusMeters != null && <tr><td style={{ color:'#64748b',padding:'2px 4px',fontWeight:600 }}>Radius</td><td style={{ color:'#1e293b',padding:'2px 4px' }}>{geo.radiusMeters}m</td></tr>}
+          {geo.type === 'CIRCLE' && geo.centerLat != null && <tr><td style={{ color:'#64748b',padding:'2px 4px',fontWeight:600 }}>Center</td><td style={{ color:'#1e293b',padding:'2px 4px',fontFamily:'monospace',fontSize:10 }}>{geo.centerLat.toFixed(5)}, {geo.centerLng?.toFixed(5)}</td></tr>}
+        </tbody>
+      </table>
+      <button onClick={onEdit} style={{ marginTop:8, width:'100%', padding:'5px 0', background:'rgba(245,158,11,0.15)', border:'1px solid rgba(245,158,11,0.3)', borderRadius:6, color:'#fbbf24', fontSize:11, fontWeight:600, cursor:'pointer' }}>✏ Edit Geofence</button>
+    </div>
+  );
+}
+
+export default DeviceTrackingPage;
